@@ -15,7 +15,7 @@ import math
 
 import requests
 import pandas as pd
-from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
+from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError, HTTPError
 
 from dash_auth_external import DashAuthExternal
 from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
@@ -736,15 +736,48 @@ app.layout = html.Div(
     prevent_initial_call=True,
 )
 def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val):
-    token = auth.get_token()
-    if not token:
+    log_lines = []
+
+    # Try to get OAuth token, catch HTTPError and show in log
+    try:
+        token = auth.get_token()
+    except HTTPError as e:
+        resp = getattr(e, "response", None)
+        body = ""
+        if resp is not None:
+            try:
+                body = resp.text
+            except Exception:
+                body = "<no body>"
+
+        log_lines.append(
+            "HTTPError while fetching token:\n"
+            f"{e}\n"
+            f"Status: {getattr(resp, 'status_code', 'unknown')}\n"
+            f"Body: {body[:500]}"
+        )
         return (
-            no_update,
-            no_update,
+            [],  # preview data
+            [],  # preview columns
+            True,  # disable full download
+            True,  # disable filtered download
+            "\n".join(log_lines),  # log contents
+            "OAuth token error – see technical log.",
+            [],  # enrollment options
+            [],  # enrollment values
+            [],  # nomination options
+            [],  # nomination values
+        )
+
+    if not token:
+        log_lines.append("No OAuth token – auth.get_token() returned None.")
+        return (
+            [],
+            [],
             True,
             True,
+            "\n".join(log_lines),
             "No OAuth token – log in.",
-            "",
             [],
             [],
             [],
@@ -758,7 +791,7 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
         o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)
     ]
 
-    rows_total, flattened, log_lines = [], [], []
+    rows_total, flattened = [], []
     for cid in campus_ids:
         role_id = ROLE_ID_MAP.get(role_val, "")
         url = f"{PROFILES_URL}?campus_id={cid}"
