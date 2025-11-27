@@ -49,7 +49,7 @@ print("DEBUG APP_URL:", APP_URL)
 PAGE_LIMIT = 50              # smaller pages reduce risk of slow responses timing out
 MAX_RETRIES = 5              # include retries for timeouts/conn errors too
 BACKOFF_SEC = 1.5            # base backoff; we also add jitter
-REQUEST_TIMEOUT = (10, 90)   # (connect timeout, read timeout) in seconds
+REQUEST_TIMEOUT = (10, 900)   # (connect timeout, read timeout) in seconds
 RETRYABLE_STATUSES = (502, 503, 504, 524)  # include common gateway/timeouts
 
 # -------------------------------------------------------------------------
