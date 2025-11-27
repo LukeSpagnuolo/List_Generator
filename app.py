@@ -35,6 +35,14 @@ PROFILES_URL = os.environ.get("PROFILES_URL", f"{SITE}/api/registration/profile/
 
 CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 
+# Debug prints (optional – you can remove later)
+print("DEBUG CLIENT_ID set:", bool(CLIENT_ID))
+print("DEBUG CLIENT_SECRET set:", bool(CLIENT_SECRET))
+print("DEBUG SITE:", SITE)
+print("DEBUG AUTH_URL:", AUTH_URL)
+print("DEBUG TOKEN_URL:", TOKEN_URL)
+print("DEBUG APP_URL:", APP_URL)
+
 # -------------------------------------------------------------------------
 # Networking & retry tuning
 # -------------------------------------------------------------------------
@@ -384,6 +392,34 @@ def remove_test_sports(df: pd.DataFrame) -> pd.DataFrame:
         mask &= ~(explicit | contains_test)
 
     return df[mask]
+
+# -------------------------------------------------------------------------
+# MERGE CARDING COLUMNS
+# -------------------------------------------------------------------------
+def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Use carding_level_mapped to fill in any missing
+    current_nomination.carding_level values where possible.
+    Operates in-place and also returns df for convenience.
+    """
+    nom_col = "current_nomination.carding_level"
+    map_col = "carding_level_mapped"
+
+    if nom_col not in df.columns or map_col not in df.columns:
+        return df
+
+    nom = df[nom_col].astype(str).str.strip()
+    mapped = df[map_col].astype(str).str.strip()
+
+    # Treat empty strings and "nan" as missing
+    nom_clean = nom.replace("nan", "")
+    is_missing = nom_clean.eq("")
+    has_mapped = mapped.ne("")
+
+    fill_mask = is_missing & has_mapped
+    df.loc[fill_mask, nom_col] = mapped[fill_mask]
+
+    return df
 
 # -------------------------------------------------------------------------
 # CAMPUS FILTER HELPER
@@ -756,6 +792,10 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
             f"Status: {getattr(resp, 'status_code', 'unknown')}\n"
             f"Body: {body[:500]}"
         )
+        log_lines.append(f"DEBUG redirect (APP_URL): {APP_URL}")
+        log_lines.append(f"DEBUG AUTH_URL: {AUTH_URL}")
+        log_lines.append(f"DEBUG TOKEN_URL: {TOKEN_URL}")
+        log_lines.append(f"DEBUG CLIENT_ID set: {bool(CLIENT_ID)}")
         return (
             [],  # preview data
             [],  # preview columns
@@ -786,10 +826,21 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Always pull ALL campus IDs from the API, then filter locally
-    campus_ids = [
-        o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)
-    ]
+    # Decide which campus IDs to pull from the API:
+    # - If campus_dd = "all" → fetch ALL campuses (heavy)
+    # - If a specific campus is selected → fetch ONLY that campus
+    if campus_val == "all" or campus_val is None:
+        campus_ids = [
+            o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)
+        ]
+    else:
+        if isinstance(campus_val, int):
+            campus_ids = [campus_val]
+        else:
+            # Fallback: default to ALL if weird
+            campus_ids = [
+                o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)
+            ]
 
     rows_total, flattened = [], []
     for cid in campus_ids:
@@ -823,10 +874,15 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
 
     global cached_df, cached_name
     cached_df = df.copy()
-    campus_tag = "all"  # we always fetch all campuses now
+    if campus_val == "all" or campus_val is None:
+        campus_tag = "all"
+    elif isinstance(campus_val, int):
+        campus_tag = str(campus_val)
+    else:
+        campus_tag = "all"
     cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
 
-    # Apply the three campus filters for the preview
+    # Apply the three campus filters for the preview (still apply for safety)
     df_view = apply_campus_filters(
         df, campus_val, birth_campus_val, current_campus_val
     )
@@ -926,6 +982,9 @@ def download_filtered_csv(
     # Strip out TEST sports before selecting columns / renaming
     df_out = remove_test_sports(df_out)
 
+    # Merge carding columns: fill missing nomination carding from mapped carding
+    df_out = merge_carding_columns(df_out)
+
     # Use selected fields if provided, otherwise default to all export columns
     if not selected_fields:
         selected_fields = FILTER_COLUMNS
@@ -984,6 +1043,9 @@ def update_filtered_preview(
 
     # Remove TEST sports
     df_out = remove_test_sports(df_out)
+
+    # Merge carding columns for preview as well
+    df_out = merge_carding_columns(df_out)
 
     if df_out.empty:
         return [], []
