@@ -14,7 +14,7 @@ import math
 import requests
 import pandas as pd
 
-from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
+from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError, Timeout
 from dash_auth_external import DashAuthExternal
 from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
 
@@ -36,13 +36,9 @@ CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 # Networking & retry tuning
 # -------------------------------------------------------------------------
 PAGE_LIMIT = 50
-MAX_RETRIES = 5
-BACKOFF_SEC = 1.5
-REQUEST_TIMEOUT = (3, 5)  # (connect timeout, read timeout) in seconds
+MAX_FETCH_SECONDS = 10   # budget per click (we still keep this, but each click only does 1 GET)
+REQUEST_TIMEOUT_SEC = 5  # single-number timeout for requests.get (seconds)
 RETRYABLE_STATUSES = (502, 503, 504, 524)
-
-# Time budget per FETCH click to avoid worker timeout
-MAX_FETCH_SECONDS = 15  # stay well below Connect/Gunicorn timeout
 
 # -------------------------------------------------------------------------
 # CAMPUS OPTIONS
@@ -238,85 +234,64 @@ def flatten_profile(p, campus_id: int) -> dict:
     return flat
 
 # -------------------------------------------------------------------------
-# CHUNKED FETCH (to avoid timeouts)
+# CHUNKED FETCH (one GET per click, hard timeout)
 # -------------------------------------------------------------------------
 def fetch_paginated_chunk(url, headers, log, deadline):
     """
-    Fetch a *chunk* of a DRF paginated endpoint.
+    Fetch a *single page* of a DRF paginated endpoint.
 
-    - Stops when:
-        • we run out of pages for this campus, OR
-        • we hit the time budget (past `deadline`).
+    - At most one HTTP request per call.
+    - Uses a hard short timeout (REQUEST_TIMEOUT_SEC).
+    - Returns immediately on any timeout / error.
+    - `deadline` is kept only to avoid starting work if we're out of time.
 
     Returns
     -------
     rows : list
         New rows fetched in this chunk.
     next_url : str or None
-        DRF "next" URL to continue from, or None if this campus is finished.
+        DRF "next" URL to continue from, or None if this campus is finished or on error.
     """
     rows = []
-    session = requests.Session()
 
-    while url and time.time() < deadline:
-        if "limit=" not in url:
-            url += ("&" if "?" in url else "?") + f"limit={PAGE_LIMIT}"
+    if not url or time.time() >= deadline:
+        return rows, url
 
-        retries, wait = 0, BACKOFF_SEC
+    if "limit=" not in url:
+        url += ("&" if "?" in url else "?") + f"limit={PAGE_LIMIT}"
 
-        while True:
-            try:
-                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-                status = resp.status_code
-            except (ReadTimeout, ConnectTimeout, ConnectionError) as e:
-                if retries < MAX_RETRIES:
-                    log.append(
-                        f"timeout/conn error on {url}: {type(e).__name__} "
-                        f"→ retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
-                    )
-                    time.sleep(wait + random.uniform(0, 0.5))
-                    retries += 1
-                    wait *= 2
-                    continue
-                else:
-                    log.append(
-                        f"giving up on {url} after {MAX_RETRIES} retries: "
-                        f"{type(e).__name__}"
-                    )
-                    return rows, url  # keep what we have; try again next click
+    try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_SEC,  # single-number timeout (seconds)
+        )
+    except (ReadTimeout, ConnectTimeout, ConnectionError, Timeout) as e:
+        log.append(f"Request timeout/error on {url}: {type(e).__name__}")
+        # keep same URL so another click can try again
+        return rows, url
+    except Exception as e:
+        log.append(f"Unexpected error on {url}: {type(e).__name__}: {str(e)[:200]}")
+        return rows, None
 
-            # If we got here, we have a response
-            if status in RETRYABLE_STATUSES and retries < MAX_RETRIES:
-                log.append(
-                    f"{url} • {status} (retryable) "
-                    f"→ retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
-                )
-                time.sleep(wait + random.uniform(0, 0.5))
-                retries += 1
-                wait *= 2
-                continue
+    status = resp.status_code
 
-            if status != 200:
-                log.append(f"{url} • {status}\n{resp.text[:300]}")
-                return rows, None
+    if status in RETRYABLE_STATUSES:
+        log.append(f"{url} • {status} (retryable) – will try again on next click.")
+        return rows, url
 
-            data = resp.json()
-            batch = data.get("results", [])
-            rows.extend(batch)
-            url = data.get("next")
+    if status != 200:
+        log.append(f"{url} • {status}\n{resp.text[:200]}")
+        return rows, None
 
-            # stop if there is no next page
-            if not url:
-                return rows, None
+    data = resp.json()
+    batch = data.get("results", [])
+    rows.extend(batch)
+    new_next = data.get("next")
 
-            # or if we're out of time
-            if time.time() >= deadline:
-                return rows, url
+    log.append(f"{url} • 200 – fetched {len(batch)} rows")
 
-            # otherwise loop to next page (no extra retries needed)
-            break
-
-    return rows, url
+    return rows, new_next
 
 # -------------------------------------------------------------------------
 # GLOBAL CACHE & FETCH STATE
@@ -440,7 +415,6 @@ def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
     nom = df[nom_col].astype(str).str.strip()
     mapped = df[map_col].astype(str).str.strip()
 
-    # Treat empty strings and "nan" as missing
     nom_clean = nom.replace("nan", "")
     is_missing = nom_clean.eq("")
     has_mapped = mapped.ne("")
@@ -496,17 +470,14 @@ def apply_campus_filters(df, campus_val, birth_campus_val, current_campus_val):
     """
     out = df
 
-    # Filter by API campus / campus_label (using campus id)
     if isinstance(campus_val, int) and "campus_label" in out.columns:
         label = CAMPUS_LABEL_MAP.get(campus_val)
         if label:
             out = out[out["campus_label"] == label]
 
-    # Filter by mapped birth campus
     if birth_campus_val and "campus_by_birth" in out.columns:
         out = out[out["campus_by_birth"] == birth_campus_val]
 
-    # Filter by mapped current campus (residence)
     if current_campus_val and "current_campus" in out.columns:
         out = out[out["current_campus"] == current_campus_val]
 
@@ -530,7 +501,6 @@ app = Dash(__name__, server=server)
 app.layout = html.Div(
     style={"fontFamily": "Arial", "margin": "2rem"},
     children=[
-        # Title & subtitle
         html.H1(
             "List Generator 5000",
             style={
@@ -548,7 +518,6 @@ app.layout = html.Div(
             },
         ),
 
-        # Campus + role filters + Fetch button
         html.Div(
             [
                 dcc.Dropdown(
@@ -605,7 +574,6 @@ app.layout = html.Div(
             },
         ),
 
-        # Data preview section (loading + main preview table)
         dcc.Loading(
             id="loading-spinner",
             type="circle",
@@ -650,7 +618,6 @@ app.layout = html.Div(
             ],
         ),
 
-        # Download options section
         html.Hr(style={"marginTop": "1.8rem", "marginBottom": "1rem"}),
         html.H3(
             "Download options",
@@ -661,7 +628,6 @@ app.layout = html.Div(
             },
         ),
 
-        # Filtered CSV preview
         html.Div(
             "Filtered CSV preview (first 10 rows)",
             style={
@@ -696,7 +662,6 @@ app.layout = html.Div(
             ],
         ),
 
-        # Download buttons
         html.Div(
             [
                 html.Button(
@@ -728,7 +693,6 @@ app.layout = html.Div(
             },
         ),
 
-        # Column multiselect for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -746,7 +710,6 @@ app.layout = html.Div(
             style={"marginBottom": "0.6rem"},
         ),
 
-        # Enrollment status filter for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -763,7 +726,6 @@ app.layout = html.Div(
             style={"marginBottom": "0.6rem"},
         ),
 
-        # Nomination claimed filter for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -780,7 +742,6 @@ app.layout = html.Div(
             style={"marginBottom": "0.8rem"},
         ),
 
-        # Collapsible technical log
         html.Details(
             [
                 html.Summary(
@@ -855,9 +816,9 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
         )
 
     headers = {"Authorization": f"Bearer {token}"}
-    log_lines = [CITY_MAP_STATUS]
+    log_lines = [CITY_MAP_STATUS, f"Fetch click #{n_clicks}"]
 
-    # ---------- 1. Initialise or continue FETCH_STATE ----------
+    # 1. Initialise or continue FETCH_STATE
     if FETCH_STATE["done"] or n_clicks == 1:
         campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
         FETCH_STATE = {
@@ -896,13 +857,12 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             [],
         )
 
-    # ---------- 2. Time budget for this click ----------
     start = time.time()
     deadline = start + MAX_FETCH_SECONDS
     new_flattened_rows = []
 
-    # ---------- 3. Loop over campuses within time budget ----------
-    while time.time() < deadline and idx < len(campus_ids):
+    # 2. Loop over campuses but only ever do ONE GET this click
+    if idx < len(campus_ids) and time.time() < deadline:
         cid = campus_ids[idx]
         role_id = ROLE_ID_MAP.get(role_val, "")
 
@@ -924,30 +884,28 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
         FETCH_STATE["total_rows"] += len(rows)
 
         if new_next:
-            # still more pages for this campus
             FETCH_STATE["next_url"] = new_next
             log_lines.append(
                 f"Campus {cid}: fetched {len(rows)} rows this click, more pages remain."
             )
-            break
         else:
-            # campus finished
             log_lines.append(
-                f"Campus {cid}: completed (fetched {len(rows)} rows this click)."
+                f"Campus {cid}: completed this campus (fetched {len(rows)} rows this click)."
             )
             idx += 1
             FETCH_STATE["current_index"] = idx
             FETCH_STATE["next_url"] = None
-            next_url = None
 
             if idx >= len(campus_ids):
                 FETCH_STATE["done"] = True
                 log_lines.append(
-                    f"All campuses fetched. Total rows so far: {FETCH_STATE['total_rows']}."
+                    f"All campuses complete. Total rows so far: {FETCH_STATE['total_rows']}."
                 )
-                break
 
-    # ---------- 4. Update cached_df with newly fetched rows ----------
+    else:
+        log_lines.append("Time budget exceeded before starting a new request.")
+
+    # 3. Update cached_df
     if new_flattened_rows:
         df_new = pd.DataFrame(new_flattened_rows)
         if cached_df.empty:
@@ -975,9 +933,8 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             [],
         )
 
-    # ---------- 5. Apply campus filters for preview ----------
+    # 4. Apply campus filters for preview
     df_view = apply_campus_filters(cached_df, campus_val, birth_campus_val, current_campus_val)
-
     columns = [{"name": c, "id": c} for c in df_view.columns]
 
     if FETCH_STATE["done"]:
@@ -988,7 +945,7 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             "Click Fetch again to continue."
         )
 
-    # ---------- 6. Build enrollment & nomination filter options ----------
+    # 5. Build enrollment & nomination filter options
     enrollment_options = []
     if "current_enrollment.admin_status" in cached_df.columns:
         vals = (
@@ -1027,7 +984,7 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
     )
 
 # -------------------------------------------------------------------------
-# FULL CSV DOWNLOAD (no extra filters except campus)
+# FULL CSV DOWNLOAD
 # -------------------------------------------------------------------------
 @app.callback(
     Output("csv-file", "data"),
@@ -1070,26 +1027,20 @@ def download_filtered_csv(
         cached_df, campus_val, birth_campus_val, current_campus_val
     )
 
-    # Enrollment status filter
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
         df_out = df_out[
             df_out["current_enrollment.admin_status"].astype(str).isin(enrollment_status_vals)
         ]
 
-    # Nomination claimed filter
     if nomination_claimed_vals and "current_nomination.redeemed" in df_out.columns:
         df_out = df_out[
             df_out["current_nomination.redeemed"].astype(str).isin(nomination_claimed_vals)
         ]
 
-    # Remove TEST sports
     df_out = remove_test_sports(df_out)
-
-    # Merge carding + level category
     df_out = merge_carding_columns(df_out)
     df_out = add_level_category_column(df_out)
 
-    # Columns
     if not selected_fields:
         selected_fields = FILTER_COLUMNS
 
@@ -1098,7 +1049,6 @@ def download_filtered_csv(
         return no_update
 
     df_filtered = df_out[fields].copy()
-
     rename_map = {field: FIELD_TO_LABEL.get(field, field) for field in fields}
     df_filtered.rename(columns=rename_map, inplace=True)
 
@@ -1133,22 +1083,17 @@ def update_filtered_preview(
         cached_df, campus_val, birth_campus_val, current_campus_val
     )
 
-    # Enrollment status filter
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
         df_out = df_out[
             df_out["current_enrollment.admin_status"].astype(str).isin(enrollment_status_vals)
         ]
 
-    # Nomination claimed filter
     if nomination_claimed_vals and "current_nomination.redeemed" in df_out.columns:
         df_out = df_out[
             df_out["current_nomination.redeemed"].astype(str).isin(nomination_claimed_vals)
         ]
 
-    # Remove TEST sports
     df_out = remove_test_sports(df_out)
-
-    # Merge carding + level category
     df_out = merge_carding_columns(df_out)
     df_out = add_level_category_column(df_out)
 
@@ -1163,7 +1108,6 @@ def update_filtered_preview(
         return [], []
 
     df_filtered = df_out[fields].copy()
-
     rename_map = {field: FIELD_TO_LABEL.get(field, field) for field in fields}
     df_filtered.rename(columns=rename_map, inplace=True)
 
