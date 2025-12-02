@@ -2,38 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 List Generator 5001
-Production-ready version using environment variables for deployment
+Timed-chunk fetch loop + original OAuth constants
 """
 
-import os
-import json
-import time
-import random
-import math
-import requests
-import pandas as pd
+# ------------------------------------------------------------------------
+# OAuth + API Configuration (RESTORED CONSTANTS)
+# ------------------------------------------------------------------------
+CLIENT_ID = "gqncUonQuByTgSZzgCHFSh9tn1F6jPygOnq2PEV5"
+CLIENT_SECRET = "MGsn5aY0y2wPoqcK2kc21f7ISm1B2X12PNuMZ8yOiV0IZby5SVSUwPqeS3ypceI7ButFUTXdCcuxZVkVoAIQnm1akFj42VkVEm7PFYSbUTN0d9EWVjxRr6BSbX3ncrbn"
 
-from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
-from dash_auth_external import DashAuthExternal
-from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
-from dash.exceptions import PreventUpdate
+SITE = "https://apps.csipacific.ca"
+APP_URL = "http://127.0.0.1:8050"  # for Posit, change this to your Posit URL
 
-# -------------------------------------------------------------------------
-# ENVIRONMENT VARIABLES (required for secure deployment)
-# -------------------------------------------------------------------------
+AUTH_URL = f"{SITE}/o/authorize"
+TOKEN_URL = f"{SITE}/o/token/"
+PROFILES_URL = f"{SITE}/api/registration/profile/"
 
-CLIENT_ID = os.environ.get("CLIENT_ID")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-
-SITE = os.environ.get("SITE", "https://apps.csipacific.ca")  # Default = production
-APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8050")  # Default for local dev
-
-AUTH_URL = os.environ.get("AUTH_URL", f"{SITE}/o/authorize")
-TOKEN_URL = os.environ.get("TOKEN_URL", f"{SITE}/o/token/")
-PROFILES_URL = os.environ.get("PROFILES_URL", f"{SITE}/api/registration/profile/")
-
-CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")  # allow override
-
+CITY_MAP_PATH = "Cities_Extended_Mapped.csv"  # put this file next to app.py
 
 # -------------------------------------------------------------------------
 # Networking / Retry Config
@@ -41,9 +26,11 @@ CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")  #
 PAGE_LIMIT = 50
 MAX_RETRIES = 5
 BACKOFF_SEC = 1.5
-REQUEST_TIMEOUT = (10, 90)
+REQUEST_TIMEOUT = (10, 20)  # shorter read timeout so a single request doesn't hang too long
 RETRYABLE_STATUSES = (502, 503, 504, 524)
 
+# Time budget per fetch click (must be < gunicorn worker timeout)
+TIME_BUDGET_SECONDS = 25.0
 
 # -------------------------------------------------------------------------
 # Campus Configuration
@@ -67,9 +54,8 @@ CAMPUS_LABEL_MAP = {
     opt["value"]: opt["label"] for opt in CAMPUS_OPTS if isinstance(opt["value"], int)
 }
 
-
 # -------------------------------------------------------------------------
-# Role Filter Options (not used yet, but kept for future)
+# Role Filter Options (kept for future expansion if needed)
 # -------------------------------------------------------------------------
 ROLE_OPTS = [
     {"label": "(all roles)", "value": ""},
@@ -78,7 +64,6 @@ ROLE_OPTS = [
     {"label": "Staff", "value": "staff"},
 ]
 ROLE_ID_MAP = {"athlete": 1, "coach": 2, "staff": 4}
-
 
 # -------------------------------------------------------------------------
 # Carding Mapping
@@ -91,6 +76,18 @@ CARDING_MAP = {
     15: "GamePlan Retired", 16: "PSO Affiliated (Uncarded)"
 }
 
+# -------------------------------------------------------------------------
+# Imports
+# -------------------------------------------------------------------------
+import json
+import time
+import random
+import requests
+import pandas as pd
+
+from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
+from dash_auth_external import DashAuthExternal
+from dash import Dash, html, dcc, dash_table, Input, Output, State
 
 # -------------------------------------------------------------------------
 # Load City → Campus Mapping
@@ -100,16 +97,13 @@ try:
     _city_df = _city_df.dropna(subset=["Location Name", "Location Mapped Centre"])
     CITY_TO_CAMPUS = (
         _city_df.drop_duplicates(subset=["Location Name"])
-        .set_index("Location Name")["Location Mapped Centre"]
-        .to_dict()
+                .set_index("Location Name")["Location Mapped Centre"]
+                .to_dict()
     )
     MAPPED_CAMPUS_NAMES = sorted(set(CITY_TO_CAMPUS.values()))
-    CITY_MAP_STATUS = f"Loaded {len(CITY_TO_CAMPUS)} city→campus mappings."
-except Exception as e:
+except Exception:
     CITY_TO_CAMPUS = {}
     MAPPED_CAMPUS_NAMES = []
-    CITY_MAP_STATUS = f"ERROR loading city map: {e}"
-
 
 # -------------------------------------------------------------------------
 # Helper functions
@@ -147,7 +141,7 @@ def derive_carding(flat):
 
     value = None
     for k in candidate_keys:
-        if k in flat:
+        if k in flat and flat[k] not in ("", None, ""):
             try:
                 val = int(str(flat[k]).strip())
                 value = val
@@ -173,332 +167,245 @@ def flatten_profile(p, campus_id):
     return derive_carding(flat)
 
 
-def fetch_paginated(url, headers, log):
+def fetch_one_page(url, headers):
     """
-    Old full paginator (not used by the chunked fetch, but kept for local/debug).
-    """
-    rows, page = [], 0
-    session = requests.Session()
-
-    while url:
-        if "limit=" not in url:
-            url += ("&" if "?" in url else "?") + f"limit={PAGE_LIMIT}"
-
-        page += 1
-        retries, wait = 0, BACKOFF_SEC
-
-        while True:
-            try:
-                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-
-                if resp.status_code in RETRYABLE_STATUSES and retries < MAX_RETRIES:
-                    time.sleep(wait + random.uniform(0, .5))
-                    retries += 1
-                    wait *= 2
-                    continue
-
-                if resp.status_code != 200:
-                    return rows
-
-                data = resp.json()
-                rows.extend(data.get("results", []))
-                url = data.get("next")
-                break
-
-            except Exception:
-                if retries < MAX_RETRIES:
-                    time.sleep(wait)
-                    retries += 1
-                    continue
-                return rows
-
-    return rows
-
-
-def fetch_paginated_chunk(url, headers, log, max_seconds=20):
-    """
-    Time-bounded paginator: fetch from `url` for at most `max_seconds`.
+    Fetch a SINGLE page from the DRF endpoint with retries.
     Returns (rows, next_url).
     """
-    if not url:
-        return [], None
-
-    rows = []
-    page = 0
     session = requests.Session()
-    start = time.time()
+    retries = 0
+    wait = BACKOFF_SEC
 
-    while url and (time.time() - start) < max_seconds:
-        if "limit=" not in url:
-            url += ("&" if "?" in url else "?") + f"limit={PAGE_LIMIT}"
+    while True:
+        try:
+            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            status = resp.status_code
 
-        page += 1
-        retries, wait = 0, BACKOFF_SEC
+            if status in RETRYABLE_STATUSES and retries < MAX_RETRIES:
+                time.sleep(wait + random.uniform(0, 0.5))
+                retries += 1
+                wait *= 2
+                continue
 
-        while True:
-            try:
-                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-                status = resp.status_code
+            if status != 200:
+                # Non-retryable error: stop this page
+                return [], None
 
-                if status in RETRYABLE_STATUSES and retries < MAX_RETRIES:
-                    log.append(
-                        f"[chunk p{page}] {url} • {status} → retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
-                    )
-                    time.sleep(wait + random.uniform(0, 0.5))
-                    retries += 1
-                    wait *= 2
-                    continue
+            data = resp.json()
+            return data.get("results", []), data.get("next")
 
-                if status != 200:
-                    log.append(f"[chunk p{page}] {url} • {status}")
-                    return rows, None
-
-                data = resp.json()
-                rows.extend(data.get("results", []))
-                url = data.get("next")
-                log.append(f"[chunk p{page}] ok, next={url}")
-                break
-
-            except (ReadTimeout, ConnectTimeout, ConnectionError) as e:
-                if retries < MAX_RETRIES:
-                    log.append(
-                        f"[chunk p{page}] timeout/conn error {e.__class__.__name__} "
-                        f"→ retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
-                    )
-                    time.sleep(wait + random.uniform(0, 0.5))
-                    retries += 1
-                    wait *= 2
-                    continue
-                else:
-                    log.append(
-                        f"[chunk p{page}] giving up after {MAX_RETRIES} retries: "
-                        f"{type(e).__name__}: {str(e)[:200]}"
-                    )
-                    return rows, url
-
-            except Exception as e:
-                log.append(
-                    f"[chunk p{page}] unexpected error: {type(e).__name__}: {str(e)[:200]}"
-                )
-                return rows, url
-
-    return rows, url
-
-
-def filter_by_campus(df, campus_val):
-    """
-    Simple campus filter for preview.
-    """
-    if df.empty or campus_val in (None, "all"):
-        return df
-    label = CAMPUS_LABEL_MAP.get(campus_val)
-    if not label:
-        return df
-    return df[df["campus_label"] == label]
+        except (ReadTimeout, ConnectTimeout, ConnectionError):
+            if retries < MAX_RETRIES:
+                time.sleep(wait + random.uniform(0, 0.5))
+                retries += 1
+                wait *= 2
+                continue
+            return [], None
+        except Exception:
+            return [], None
 
 
 # -------------------------------------------------------------------------
 # App Setup
 # -------------------------------------------------------------------------
-auth = DashAuthExternal(AUTH_URL, TOKEN_URL, APP_URL, CLIENT_ID, CLIENT_SECRET)
+auth = DashAuthExternal(
+    AUTH_URL,
+    TOKEN_URL,
+    app_url=APP_URL,
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET
+)
+
 server = auth.server
 app = Dash(__name__, server=server)
 
 cached_df = pd.DataFrame()
 cached_name = ""
 
+# State for chunked fetch across button clicks
+fetch_state = {
+    "campus_ids": [],
+    "current_campus_index": 0,
+    "next_url": None,
+    "done": True,
+}
 
 # -------------------------------------------------------------------------
-# UI Layout
+# UI Layout (simple)
 # -------------------------------------------------------------------------
 app.layout = html.Div(
     [
-        html.H1("List Generator 5000"),
+        html.H1("List Generator 5001"),
         html.H3("Campus filters"),
 
-        dcc.Dropdown(id="campus-dd", options=CAMPUS_OPTS, value="all"),
+        dcc.Dropdown(
+            id="campus-dd",
+            options=CAMPUS_OPTS,
+            value="all",
+            placeholder="Filter preview by campus",
+            style={"width": "300px"},
+        ),
 
-        html.Button("Fetch ALL (chunked)", id="btn-fetch"),
-        html.Div(id="status-msg", style={"marginTop": "0.5rem"}),
+        html.Button("Fetch (chunked)", id="btn-fetch"),
 
-        dash_table.DataTable(id="preview", page_size=10),
+        html.Div(
+            id="status-text",
+            style={"marginTop": "0.5rem", "fontSize": "0.9rem", "color": "#555"},
+        ),
+
+        dash_table.DataTable(
+            id="preview",
+            page_size=10,
+            style_table={"overflowX": "auto", "marginTop": "0.8rem"},
+        ),
 
         html.Hr(),
-        html.H3("Filtered CSV preview"),
-        dash_table.DataTable(id="filtered-preview", page_size=10),
+        html.H3("Filtered CSV preview (first 10 rows)"),
+        dash_table.DataTable(
+            id="filtered-preview",
+            page_size=10,
+            style_table={"overflowX": "auto"},
+        ),
 
         html.Button("Download Filtered CSV", id="btn-dl-filter"),
         dcc.Download(id="csv-file-filtered"),
 
-        # Stores + interval for chunked fetching
-        dcc.Store(id="df-store"),
-        dcc.Store(id="fetch-state", data={"campus_next": {}, "done": True}),
-        dcc.Interval(
-            id="fetch-interval",
-            interval=3_000,  # 3 seconds between chunks
-            n_intervals=0,
-            disabled=True,
-        ),
+        dcc.Store(id="dummy-store"),  # just to keep layout happy if expanded later
     ]
 )
-
 
 # -------------------------------------------------------------------------
 # Callbacks
 # -------------------------------------------------------------------------
-
-# 1) Start chunked Fetch ALL when button is clicked
-@app.callback(
-    Output("fetch-state", "data"),
-    Output("fetch-interval", "disabled"),
-    Output("status-msg", "children"),
-    Input("btn-fetch", "n_clicks"),
-    prevent_initial_call=True,
-)
-def start_fetch_all(n_clicks):
-    global cached_df, cached_name
-
-    if not n_clicks:
-        raise PreventUpdate
-
-    token = auth.get_token()
-    if not token:
-        return {"campus_next": {}, "done": True}, True, "No OAuth token – log in."
-
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Seed "next" URLs for every campus
-    campus_ids = [v for v in CAMPUS_LABEL_MAP.keys()]
-    campus_next = {}
-    for cid in campus_ids:
-        url = f"{PROFILES_URL}?campus_id={cid}"
-        campus_next[str(cid)] = url
-
-    # Reset global cache
-    cached_df = pd.DataFrame()
-    cached_name = "list_generator.csv"
-
-    state = {
-        "campus_next": campus_next,  # str(cid) -> url or None
-        "done": False,
-    }
-
-    msg = f"{CITY_MAP_STATUS} | Starting chunked fetch..."
-
-    return state, False, msg  # enable interval
-
-
-# 2) Interval-driven chunked fetch loop
 @app.callback(
     Output("preview", "data"),
     Output("preview", "columns"),
-    Output("fetch-state", "data"),
-    Output("fetch-interval", "disabled"),
-    Output("status-msg", "children"),
-    Input("fetch-interval", "n_intervals"),
-    State("fetch-state", "data"),
+    Output("status-text", "children"),
+    Input("btn-fetch", "n_clicks"),
     State("campus-dd", "value"),
-    State("status-msg", "children"),
     prevent_initial_call=True,
 )
-def continue_fetch_all(n_intervals, state, campus_val, status_text):
-    global cached_df
-
-    if not state or state.get("done", False):
-        # Nothing to do; stop interval
-        raise PreventUpdate
+def fetch_profiles(n_clicks, campus_val):
+    global cached_df, cached_name, fetch_state
 
     token = auth.get_token()
     if not token:
-        state["done"] = True
-        return [], [], state, True, "Auth error – please log in again."
+        return [], [], "No OAuth token – please log in via the auth screen."
 
     headers = {"Authorization": f"Bearer {token}"}
-    campus_next = state.get("campus_next", {})
-    log = []
 
-    # Find the next campus that still has pages
-    campus_ids = [v for v in CAMPUS_LABEL_MAP.keys()]
-    target_cid = None
-    for cid in campus_ids:
-        if campus_next.get(str(cid)):
-            target_cid = cid
+    # If this is the first click or a completed run, start a new multi-campus fetch
+    if n_clicks == 1 or fetch_state["done"] or not fetch_state["campus_ids"]:
+        campus_ids = sorted([v for v in CAMPUS_LABEL_MAP.keys()])
+        fetch_state = {
+            "campus_ids": campus_ids,
+            "current_campus_index": 0,
+            "next_url": None,
+            "done": False,
+        }
+        cached_df = pd.DataFrame()
+        cached_name = "list_generator.csv"
+        status_prefix = "Started new fetch run."
+    else:
+        status_prefix = "Resuming fetch run."
+
+    start = time.perf_counter()
+    total_new_rows = 0
+
+    # Chunked fetch loop: respect TIME_BUDGET_SECONDS
+    while (
+        not fetch_state["done"]
+        and (time.perf_counter() - start) < TIME_BUDGET_SECONDS
+    ):
+        campus_ids = fetch_state["campus_ids"]
+        idx = fetch_state["current_campus_index"]
+
+        if idx >= len(campus_ids):
+            fetch_state["done"] = True
             break
 
-    # If all campuses done
-    if target_cid is None:
-        state["done"] = True
-        msg = f"Fetch ALL complete. Total profiles loaded: {len(cached_df)}"
+        cid = campus_ids[idx]
+        url = fetch_state["next_url"] or f"{PROFILES_URL}?campus_id={cid}"
 
-        df_view = filter_by_campus(cached_df, campus_val)
-        cols = [{"name": c, "id": c} for c in df_view.columns]
+        page_rows, next_url = fetch_one_page(url, headers)
 
-        return (
-            df_view.to_dict("records"),
-            cols,
-            state,
-            True,  # disable interval
-            msg,
+        # If we got no rows and no next_url, consider this campus done and move on
+        if not page_rows and not next_url:
+            fetch_state["current_campus_index"] += 1
+            fetch_state["next_url"] = None
+            # If that was the last campus, mark done
+            if fetch_state["current_campus_index"] >= len(campus_ids):
+                fetch_state["done"] = True
+            continue
+
+        # Flatten and append rows
+        flattened = [flatten_profile(r, cid) for r in page_rows]
+        if flattened:
+            df_new = pd.DataFrame(flattened)
+            if cached_df.empty:
+                cached_df = df_new
+            else:
+                cached_df = pd.concat([cached_df, df_new], ignore_index=True)
+            total_new_rows += len(flattened)
+
+        # Update next_url or move to next campus
+        fetch_state["next_url"] = next_url
+        if next_url is None:
+            fetch_state["current_campus_index"] += 1
+            fetch_state["next_url"] = None
+            if fetch_state["current_campus_index"] >= len(campus_ids):
+                fetch_state["done"] = True
+
+    # Build preview filtered by campus selection
+    if cached_df.empty:
+        return [], [], f"{status_prefix} No data fetched yet."
+
+    if campus_val == "all":
+        df_view = cached_df
+    else:
+        label = CAMPUS_LABEL_MAP.get(campus_val)
+        if label:
+            df_view = cached_df[cached_df["campus_label"] == label]
+        else:
+            df_view = cached_df
+
+    preview_data = df_view.head(10).to_dict("records")
+    preview_cols = [{"name": c, "id": c} for c in df_view.columns]
+
+    total_rows = len(cached_df)
+    if fetch_state["done"]:
+        status = f"{status_prefix} Fetched {total_rows} rows across all campuses. (Run complete.)"
+    else:
+        status = (
+            f"{status_prefix} Added {total_new_rows} rows this pass; "
+            f"{total_rows} rows total so far. Click 'Fetch (chunked)' again to continue."
         )
 
-    # Pull one time-limited chunk for this campus
-    cid_str = str(target_cid)
-    url_start = campus_next.get(cid_str)
-
-    log.append(f"Chunk {n_intervals}: campus {target_cid}, starting from {url_start}")
-    rows, next_url = fetch_paginated_chunk(url_start, headers, log, max_seconds=20)
-
-    # Flatten and append
-    if rows:
-        flattened = [flatten_profile(r, target_cid) for r in rows]
-        new_df = pd.DataFrame(flattened)
-
-        if cached_df.empty:
-            cached_df = new_df
-        else:
-            cached_df = pd.concat([cached_df, new_df], ignore_index=True)
-
-    # Update next URL for this campus
-    campus_next[cid_str] = next_url  # None when done
-    state["campus_next"] = campus_next
-
-    # Build preview of what we have so far
-    df_view = filter_by_campus(cached_df, campus_val)
-    cols = [{"name": c, "id": c} for c in df_view.columns]
-
-    msg = f"Fetching… currently loaded {len(cached_df)} profiles."
-
-    return (
-        df_view.to_dict("records"),
-        cols,
-        state,
-        False,  # keep interval running until all campuses done
-        msg,
-    )
+    return preview_data, preview_cols, status
 
 
-# 3) Filtered preview (first 10 rows of full cached_df, independent of campus selection)
 @app.callback(
     Output("filtered-preview", "data"),
     Output("filtered-preview", "columns"),
     Input("preview", "data"),
 )
 def preview_filtered(_):
+    global cached_df
     if cached_df.empty:
         return [], []
     preview = cached_df.head(10)
     return preview.to_dict("records"), [{"name": c, "id": c} for c in preview.columns]
 
 
-# 4) Download filtered (currently just the full cached_df)
 @app.callback(
     Output("csv-file-filtered", "data"),
     Input("btn-dl-filter", "n_clicks"),
     prevent_initial_call=True,
 )
 def download_filtered(_):
+    global cached_df, cached_name
     if cached_df.empty:
-        return no_update
+        return None
     return dcc.send_data_frame(cached_df.to_csv, cached_name, index=False)
 
 
