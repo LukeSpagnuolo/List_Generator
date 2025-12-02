@@ -4,6 +4,7 @@
 List Generator 5000 – Posit/Connect version
 - Uses environment variables for secrets/URLs
 - Chunked fetch to avoid worker timeouts
+- Auto-fetch via dcc.Interval so you don't have to keep clicking Fetch
 """
 
 import os
@@ -16,7 +17,17 @@ import pandas as pd
 
 from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError, Timeout
 from dash_auth_external import DashAuthExternal
-from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
+from dash import (
+    Dash,
+    html,
+    dcc,
+    dash_table,
+    Input,
+    Output,
+    State,
+    no_update,
+    callback_context,
+)
 
 # -------------------------------------------------------------------------
 # ENV VARIABLES (must match Posit configuration)
@@ -36,7 +47,7 @@ CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 # Networking & retry tuning
 # -------------------------------------------------------------------------
 PAGE_LIMIT = 50
-MAX_FETCH_SECONDS = 10   # budget per click (we still keep this, but each click only does 1 GET)
+MAX_FETCH_SECONDS = 10   # budget per callback; we still only do 1 GET
 REQUEST_TIMEOUT_SEC = 5  # single-number timeout for requests.get (seconds)
 RETRYABLE_STATUSES = (502, 503, 504, 524)
 
@@ -234,7 +245,7 @@ def flatten_profile(p, campus_id: int) -> dict:
     return flat
 
 # -------------------------------------------------------------------------
-# CHUNKED FETCH (one GET per click, hard timeout)
+# CHUNKED FETCH (one GET per callback, hard timeout)
 # -------------------------------------------------------------------------
 def fetch_paginated_chunk(url, headers, log, deadline):
     """
@@ -268,7 +279,7 @@ def fetch_paginated_chunk(url, headers, log, deadline):
         )
     except (ReadTimeout, ConnectTimeout, ConnectionError, Timeout) as e:
         log.append(f"Request timeout/error on {url}: {type(e).__name__}")
-        # keep same URL so another click can try again
+        # keep same URL so another callback (interval tick) can try again
         return rows, url
     except Exception as e:
         log.append(f"Unexpected error on {url}: {type(e).__name__}: {str(e)[:200]}")
@@ -277,7 +288,7 @@ def fetch_paginated_chunk(url, headers, log, deadline):
     status = resp.status_code
 
     if status in RETRYABLE_STATUSES:
-        log.append(f"{url} • {status} (retryable) – will try again on next click.")
+        log.append(f"{url} • {status} (retryable) – will try again on next trigger.")
         return rows, url
 
     if status != 200:
@@ -574,6 +585,14 @@ app.layout = html.Div(
             },
         ),
 
+        # Auto-fetch interval (disabled until Fetch is clicked)
+        dcc.Interval(
+            id="auto-fetch-interval",
+            interval=3000,   # 3 seconds
+            n_intervals=0,
+            disabled=True,
+        ),
+
         dcc.Loading(
             id="loading-spinner",
             type="circle",
@@ -777,7 +796,7 @@ app.layout = html.Div(
 )
 
 # -------------------------------------------------------------------------
-# CALLBACKS
+# MAIN FETCH CALLBACK (button + auto-interval)
 # -------------------------------------------------------------------------
 @app.callback(
     Output("preview", "data"),
@@ -790,15 +809,24 @@ app.layout = html.Div(
     Output("enrollment-status-dd", "value"),
     Output("nomination-claimed-dd", "options"),
     Output("nomination-claimed-dd", "value"),
+    Output("auto-fetch-interval", "disabled"),   # enable/disable auto-fetch
     Input("btn-fetch", "n_clicks"),
+    Input("auto-fetch-interval", "n_intervals"),
     State("campus-dd", "value"),
     State("birth-campus-dd", "value"),
     State("current-campus-dd", "value"),
     State("role-dd", "value"),
     prevent_initial_call=True,
 )
-def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, role_val):
+def fetch_profiles(n_clicks, n_intervals,
+                   campus_val, birth_campus_val, current_campus_val, role_val):
     global cached_df, cached_name, FETCH_STATE
+
+    n_clicks = n_clicks or 0
+    n_intervals = n_intervals or 0
+
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
 
     token = auth.get_token()
     if not token:
@@ -813,30 +841,50 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             [],
             [],
             [],
+            True,  # disable interval on auth failure
         )
 
     headers = {"Authorization": f"Bearer {token}"}
-    log_lines = [CITY_MAP_STATUS, f"Fetch click #{n_clicks}"]
+    log_lines = [
+        CITY_MAP_STATUS,
+        f"Triggered by: {trigger_id}, clicks={n_clicks}, intervals={n_intervals}",
+    ]
 
-    # 1. Initialise or continue FETCH_STATE
-    if FETCH_STATE["done"] or n_clicks == 1:
-        campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
-        FETCH_STATE = {
-            "campus_ids": campus_ids,
-            "current_index": 0,
-            "next_url": None,
-            "done": False,
-            "total_rows": 0,
-        }
-        cached_df = pd.DataFrame()
-        campus_tag = "all"
-        cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
-        log_lines.append("Starting NEW full fetch cycle.")
-    else:
-        log_lines.append(
-            f"Continuing fetch at campus index "
-            f"{FETCH_STATE['current_index']} of {len(FETCH_STATE['campus_ids'])}."
-        )
+    # 1. Initialise / reset FETCH_STATE when Fetch button starts a new cycle
+    if trigger_id == "btn-fetch":
+        if FETCH_STATE["done"] or n_clicks <= 1:
+            campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
+            FETCH_STATE = {
+                "campus_ids": campus_ids,
+                "current_index": 0,
+                "next_url": None,
+                "done": False,
+                "total_rows": 0,
+            }
+            cached_df = pd.DataFrame()
+            campus_tag = "all"
+            cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
+            log_lines.append("Starting NEW full fetch cycle.")
+        else:
+            log_lines.append("Manual Fetch click during an active cycle – continuing.")
+
+    # If triggered by interval but we've never started (no campuses), do nothing
+    if trigger_id == "auto-fetch-interval" and not FETCH_STATE["campus_ids"]:
+        log_lines.append("Auto interval fired but no active fetch cycle – ignoring.")
+        if cached_df.empty:
+            return (
+                [],
+                [],
+                True,
+                True,
+                "\n".join(log_lines),
+                "No profiles fetched yet. Click Fetch to start.",
+                [],
+                [],
+                [],
+                [],
+                True,  # keep interval disabled
+            )
 
     campus_ids = FETCH_STATE["campus_ids"]
     idx = FETCH_STATE["current_index"]
@@ -855,14 +903,15 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             [],
             [],
             [],
+            True,
         )
 
     start = time.time()
     deadline = start + MAX_FETCH_SECONDS
     new_flattened_rows = []
 
-    # 2. Loop over campuses but only ever do ONE GET this click
-    if idx < len(campus_ids) and time.time() < deadline:
+    # 2. Only fetch if not done
+    if not FETCH_STATE["done"] and idx < len(campus_ids) and time.time() < deadline:
         cid = campus_ids[idx]
         role_id = ROLE_ID_MAP.get(role_val, "")
 
@@ -886,11 +935,11 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
         if new_next:
             FETCH_STATE["next_url"] = new_next
             log_lines.append(
-                f"Campus {cid}: fetched {len(rows)} rows this click, more pages remain."
+                f"Campus {cid}: fetched {len(rows)} rows this trigger, more pages remain."
             )
         else:
             log_lines.append(
-                f"Campus {cid}: completed this campus (fetched {len(rows)} rows this click)."
+                f"Campus {cid}: completed this campus (fetched {len(rows)} rows this trigger)."
             )
             idx += 1
             FETCH_STATE["current_index"] = idx
@@ -901,9 +950,11 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
                 log_lines.append(
                     f"All campuses complete. Total rows so far: {FETCH_STATE['total_rows']}."
                 )
-
     else:
-        log_lines.append("Time budget exceeded before starting a new request.")
+        if FETCH_STATE["done"]:
+            log_lines.append("Fetch cycle is already complete – no new request.")
+        else:
+            log_lines.append("Time budget exceeded before starting a new request.")
 
     # 3. Update cached_df
     if new_flattened_rows:
@@ -916,10 +967,11 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
                 .drop_duplicates()
             )
     else:
-        log_lines.append("No new rows fetched this click.")
+        log_lines.append("No new rows fetched this trigger.")
 
     if cached_df.empty:
         loading_msg = "No profiles fetched yet. Click Fetch to start."
+        interval_disabled = FETCH_STATE["done"]
         return (
             [],
             [],
@@ -931,10 +983,13 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
             [],
             [],
             [],
+            interval_disabled,
         )
 
     # 4. Apply campus filters for preview
-    df_view = apply_campus_filters(cached_df, campus_val, birth_campus_val, current_campus_val)
+    df_view = apply_campus_filters(
+        cached_df, campus_val, birth_campus_val, current_campus_val
+    )
     columns = [{"name": c, "id": c} for c in df_view.columns]
 
     if FETCH_STATE["done"]:
@@ -942,7 +997,7 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
     else:
         loading_msg = (
             f"Partial fetch: {len(df_view)} visible / {len(cached_df)} total rows so far. "
-            "Click Fetch again to continue."
+            "Auto-fetch is continuing…"
         )
 
     # 5. Build enrollment & nomination filter options
@@ -970,6 +1025,9 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
         nvals.sort()
         nomination_options = [{"label": v, "value": v} for v in nvals]
 
+    # Interval is enabled while fetching, disabled when done
+    interval_disabled = FETCH_STATE["done"]
+
     return (
         df_view.to_dict("records"),
         columns,
@@ -981,6 +1039,7 @@ def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, r
         [],
         nomination_options,
         [],
+        interval_disabled,
     )
 
 # -------------------------------------------------------------------------
