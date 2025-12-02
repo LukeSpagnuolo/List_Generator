@@ -5,13 +5,13 @@ List Generator 5000 – Posit/Connect version
 - Uses environment variables for secrets/URLs
 - Chunked fetch to avoid worker timeouts
 - Auto-fetch via dcc.Interval so you don't have to keep clicking Fetch
+- State is kept in dcc.Store (safe across workers)
 """
 
 import os
 import json
 import time
 import random
-import math
 import requests
 import pandas as pd
 
@@ -47,8 +47,8 @@ CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 # Networking & retry tuning
 # -------------------------------------------------------------------------
 PAGE_LIMIT = 50
-MAX_FETCH_SECONDS = 10   # budget per callback; we still only do 1 GET
-REQUEST_TIMEOUT_SEC = 5  # single-number timeout for requests.get (seconds)
+MAX_FETCH_SECONDS = 10      # budget per callback (we still do only 1 GET)
+REQUEST_TIMEOUT_SEC = 5     # timeout for a single requests.get (seconds)
 RETRYABLE_STATUSES = (502, 503, 504, 524)
 
 # -------------------------------------------------------------------------
@@ -210,13 +210,11 @@ def flatten_profile(p, campus_id: int) -> dict:
     """
     flat = flatten_json(p)
 
-    # API / nomination campus from profile
     flat["campus_id"] = str(campus_id)
     flat["campus_label"] = CAMPUS_LABEL_MAP.get(
         campus_id, f"Unknown ({campus_id})"
     )
 
-    # Map birth & residence city → "Location Mapped Centre"
     birth_city = (
         flat.get("birth_city.name")
         or flat.get("person.birth_city.name")
@@ -230,16 +228,11 @@ def flatten_profile(p, campus_id: int) -> dict:
         or ""
     )
 
-    # Normalise for lookup (lower + strip)
     birth_key = birth_city.strip().lower() if birth_city else ""
-    res_key = res_city.strip().lower() if res_city else ""
+    res_key   = res_city.strip().lower()   if res_city   else ""
 
-    flat["campus_by_birth"] = (
-        CITY_TO_CAMPUS.get(birth_key, "") if birth_key else ""
-    )
-    flat["current_campus"] = (
-        CITY_TO_CAMPUS.get(res_key, "") if res_key else ""
-    )
+    flat["campus_by_birth"] = CITY_TO_CAMPUS.get(birth_key, "") if birth_key else ""
+    flat["current_campus"]  = CITY_TO_CAMPUS.get(res_key, "")   if res_key   else ""
 
     flat = derive_carding_columns(flat)
     return flat
@@ -252,9 +245,8 @@ def fetch_paginated_chunk(url, headers, log, deadline):
     Fetch a *single page* of a DRF paginated endpoint.
 
     - At most one HTTP request per call.
-    - Uses a hard short timeout (REQUEST_TIMEOUT_SEC).
+    - Uses a short timeout (REQUEST_TIMEOUT_SEC).
     - Returns immediately on any timeout / error.
-    - `deadline` is kept only to avoid starting work if we're out of time.
 
     Returns
     -------
@@ -275,12 +267,11 @@ def fetch_paginated_chunk(url, headers, log, deadline):
         resp = requests.get(
             url,
             headers=headers,
-            timeout=REQUEST_TIMEOUT_SEC,  # single-number timeout (seconds)
+            timeout=REQUEST_TIMEOUT_SEC,
         )
     except (ReadTimeout, ConnectTimeout, ConnectionError, Timeout) as e:
         log.append(f"Request timeout/error on {url}: {type(e).__name__}")
-        # keep same URL so another callback (interval tick) can try again
-        return rows, url
+        return rows, url  # keep same URL to retry on next interval
     except Exception as e:
         log.append(f"Unexpected error on {url}: {type(e).__name__}: {str(e)[:200]}")
         return rows, None
@@ -303,19 +294,6 @@ def fetch_paginated_chunk(url, headers, log, deadline):
     log.append(f"{url} • 200 – fetched {len(batch)} rows")
 
     return rows, new_next
-
-# -------------------------------------------------------------------------
-# GLOBAL CACHE & FETCH STATE
-# -------------------------------------------------------------------------
-cached_df, cached_name = pd.DataFrame(), ""
-
-FETCH_STATE = {
-    "campus_ids": [],
-    "current_index": 0,
-    "next_url": None,
-    "done": True,
-    "total_rows": 0,
-}
 
 # -------------------------------------------------------------------------
 # EXPORT COLUMN SPECS (field name → pretty label)
@@ -365,9 +343,9 @@ EXPORT_COLUMNS = [
     ("level_category",                     "Level Category"),
 ]
 
-FILTER_COLUMNS = [field for field, _ in EXPORT_COLUMNS]
-FIELD_TO_LABEL = {field: label for field, label in EXPORT_COLUMNS}
-LABEL_TO_FIELD = {label: field for field, label in EXPORT_COLUMNS}
+FILTER_COLUMNS   = [field for field, _ in EXPORT_COLUMNS]
+FIELD_TO_LABEL   = {field: label for field, label in EXPORT_COLUMNS}
+LABEL_TO_FIELD   = {label: field for field, label in EXPORT_COLUMNS}
 
 # -------------------------------------------------------------------------
 # TEST SPORTS TO EXCLUDE FROM FILTERED DOWNLOAD
@@ -438,7 +416,7 @@ def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
 def add_level_category_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add 'level_category' based on current_nomination.carding_level (text).
-    Rules:
+
     - Prov Dev 1/2/3 → Provincial Development
     - NSO Affiliated (Uncarded) → Canadian Development
     - SR, SR1, SR2, C, C1, D, SRI, DI, C1I → Canadian Elite
@@ -790,13 +768,17 @@ app.layout = html.Div(
             style={"marginTop": "1.0rem"},
         ),
 
+        # Stores for cross-callback state
+        dcc.Store(id="store-fetch-state"),
+        dcc.Store(id="store-cached-rows"),
+
         dcc.Download(id="csv-file"),
         dcc.Download(id="csv-file-filtered"),
     ],
 )
 
 # -------------------------------------------------------------------------
-# MAIN FETCH CALLBACK (button + auto-interval)
+# MAIN FETCH CALLBACK (button + auto-interval, state in Stores)
 # -------------------------------------------------------------------------
 @app.callback(
     Output("preview", "data"),
@@ -810,109 +792,118 @@ app.layout = html.Div(
     Output("nomination-claimed-dd", "options"),
     Output("nomination-claimed-dd", "value"),
     Output("auto-fetch-interval", "disabled"),   # enable/disable auto-fetch
+    Output("store-fetch-state", "data"),
+    Output("store-cached-rows", "data"),
     Input("btn-fetch", "n_clicks"),
     Input("auto-fetch-interval", "n_intervals"),
     State("campus-dd", "value"),
     State("birth-campus-dd", "value"),
     State("current-campus-dd", "value"),
     State("role-dd", "value"),
+    State("store-fetch-state", "data"),
+    State("store-cached-rows", "data"),
     prevent_initial_call=True,
 )
 def fetch_profiles(n_clicks, n_intervals,
-                   campus_val, birth_campus_val, current_campus_val, role_val):
-    global cached_df, cached_name, FETCH_STATE
+                   campus_val, birth_campus_val, current_campus_val, role_val,
+                   fetch_state, rows_store):
 
-    n_clicks = n_clicks or 0
+    n_clicks    = n_clicks or 0
     n_intervals = n_intervals or 0
 
     ctx = callback_context
     trigger_id = ctx.triggered[0]["prop_id"].split(".")[0] if ctx.triggered else None
 
-    token = auth.get_token()
-    if not token:
-        return (
-            no_update,
-            no_update,
-            True,
-            True,
-            "No OAuth token – log in.",
-            "",
-            [],
-            [],
-            [],
-            [],
-            True,  # disable interval on auth failure
-        )
+    # Initialise stores if empty
+    if fetch_state is None:
+        fetch_state = {
+            "campus_ids": [],
+            "current_index": 0,
+            "next_url": None,
+            "done": True,
+            "total_rows": 0,
+            "cached_name": "profiles_all.csv",
+        }
+    if rows_store is None:
+        rows_store = []
 
-    headers = {"Authorization": f"Bearer {token}"}
     log_lines = [
         CITY_MAP_STATUS,
         f"Triggered by: {trigger_id}, clicks={n_clicks}, intervals={n_intervals}",
     ]
 
-    # 1. Initialise / reset FETCH_STATE when Fetch button starts a new cycle
-    if trigger_id == "btn-fetch":
-        if FETCH_STATE["done"] or n_clicks <= 1:
-            campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
-            FETCH_STATE = {
-                "campus_ids": campus_ids,
-                "current_index": 0,
-                "next_url": None,
-                "done": False,
-                "total_rows": 0,
-            }
-            cached_df = pd.DataFrame()
-            campus_tag = "all"
-            cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
-            log_lines.append("Starting NEW full fetch cycle.")
-        else:
-            log_lines.append("Manual Fetch click during an active cycle – continuing.")
-
-    # If triggered by interval but we've never started (no campuses), do nothing
-    if trigger_id == "auto-fetch-interval" and not FETCH_STATE["campus_ids"]:
-        log_lines.append("Auto interval fired but no active fetch cycle – ignoring.")
-        if cached_df.empty:
-            return (
-                [],
-                [],
-                True,
-                True,
-                "\n".join(log_lines),
-                "No profiles fetched yet. Click Fetch to start.",
-                [],
-                [],
-                [],
-                [],
-                True,  # keep interval disabled
-            )
-
-    campus_ids = FETCH_STATE["campus_ids"]
-    idx = FETCH_STATE["current_index"]
-    next_url = FETCH_STATE["next_url"]
-
-    if not campus_ids:
-        log_lines.append("No campus IDs available.")
+    # Auth
+    token = auth.get_token()
+    if not token:
+        log_lines.append("No OAuth token – please log in.")
         return (
-            [],
-            [],
-            True,
-            True,
+            [], [], True, True,
             "\n".join(log_lines),
-            "No campuses configured.",
-            [],
-            [],
-            [],
-            [],
-            True,
+            "No OAuth token – log in.",
+            [], [], [], [],
+            True,          # interval disabled
+            fetch_state,
+            rows_store,
         )
 
-    start = time.time()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # If Fetch button clicked: (re)start a cycle
+    if trigger_id == "btn-fetch":
+        campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
+        fetch_state = {
+            "campus_ids": campus_ids,
+            "current_index": 0,
+            "next_url": None,
+            "done": False,
+            "total_rows": 0,
+            "cached_name": f"profiles_all{('_'+role_val) if role_val else ''}.csv",
+        }
+        rows_store = []
+        log_lines.append("Starting NEW full fetch cycle.")
+
+    campus_ids = fetch_state.get("campus_ids", [])
+    idx        = fetch_state.get("current_index", 0)
+    next_url   = fetch_state.get("next_url", None)
+    done       = fetch_state.get("done", True)
+
+    # If interval fires but no active cycle, just show existing data
+    if trigger_id == "auto-fetch-interval" and (not campus_ids or done):
+        log_lines.append("Auto interval fired but no active fetch cycle – ignoring.")
+        df_all = pd.DataFrame(rows_store) if rows_store else pd.DataFrame()
+        if df_all.empty:
+            return (
+                [], [], True, True,
+                "\n".join(log_lines),
+                "No profiles fetched yet. Click Fetch to start.",
+                [], [], [], [],
+                True,
+                fetch_state,
+                rows_store,
+            )
+
+        df_view = apply_campus_filters(df_all, campus_val, birth_campus_val, current_campus_val)
+        cols = [{"name": c, "id": c} for c in df_view.columns]
+        return (
+            df_view.to_dict("records"),
+            cols,
+            False,
+            False,
+            "\n".join(log_lines),
+            f"Profiles loaded: {len(df_view)} visible / {len(df_all)} total.",
+            [], [], [], [],
+            True,
+            fetch_state,
+            rows_store,
+        )
+
+    start    = time.time()
     deadline = start + MAX_FETCH_SECONDS
     new_flattened_rows = []
 
-    # 2. Only fetch if not done
-    if not FETCH_STATE["done"] and idx < len(campus_ids) and time.time() < deadline:
-        cid = campus_ids[idx]
+    # Perform at most one chunk fetch if cycle is active
+    if not done and campus_ids and idx < len(campus_ids) and time.time() < deadline:
+        cid     = campus_ids[idx]
         role_id = ROLE_ID_MAP.get(role_val, "")
 
         if not next_url:
@@ -930,10 +921,10 @@ def fetch_profiles(n_clicks, n_intervals,
         for r in rows:
             new_flattened_rows.append(flatten_profile(r, cid))
 
-        FETCH_STATE["total_rows"] += len(rows)
+        fetch_state["total_rows"] += len(rows)
 
         if new_next:
-            FETCH_STATE["next_url"] = new_next
+            fetch_state["next_url"] = new_next
             log_lines.append(
                 f"Campus {cid}: fetched {len(rows)} rows this trigger, more pages remain."
             )
@@ -942,39 +933,33 @@ def fetch_profiles(n_clicks, n_intervals,
                 f"Campus {cid}: completed this campus (fetched {len(rows)} rows this trigger)."
             )
             idx += 1
-            FETCH_STATE["current_index"] = idx
-            FETCH_STATE["next_url"] = None
+            fetch_state["current_index"] = idx
+            fetch_state["next_url"] = None
 
             if idx >= len(campus_ids):
-                FETCH_STATE["done"] = True
+                fetch_state["done"] = True
                 log_lines.append(
-                    f"All campuses complete. Total rows so far: {FETCH_STATE['total_rows']}."
+                    f"All campuses complete. Total rows so far: {fetch_state['total_rows']}."
                 )
     else:
-        if FETCH_STATE["done"]:
+        if done:
             log_lines.append("Fetch cycle is already complete – no new request.")
         else:
             log_lines.append("Time budget exceeded before starting a new request.")
 
-    # 3. Update cached_df
+    # Update cached rows in Store
     if new_flattened_rows:
-        df_new = pd.DataFrame(new_flattened_rows)
-        if cached_df.empty:
-            cached_df = df_new
-        else:
-            cached_df = (
-                pd.concat([cached_df, df_new], ignore_index=True)
-                .drop_duplicates()
-            )
+        rows_store.extend(new_flattened_rows)
     else:
         log_lines.append("No new rows fetched this trigger.")
 
-    if cached_df.empty:
+    df_all = pd.DataFrame(rows_store) if rows_store else pd.DataFrame()
+
+    if df_all.empty:
         loading_msg = "No profiles fetched yet. Click Fetch to start."
-        interval_disabled = FETCH_STATE["done"]
+        interval_disabled = fetch_state.get("done", True)
         return (
-            [],
-            [],
+            [], [],
             True,
             True,
             "\n".join(log_lines),
@@ -984,27 +969,27 @@ def fetch_profiles(n_clicks, n_intervals,
             [],
             [],
             interval_disabled,
+            fetch_state,
+            rows_store,
         )
 
-    # 4. Apply campus filters for preview
-    df_view = apply_campus_filters(
-        cached_df, campus_val, birth_campus_val, current_campus_val
-    )
-    columns = [{"name": c, "id": c} for c in df_view.columns]
+    # Apply campus filters for preview
+    df_view = apply_campus_filters(df_all, campus_val, birth_campus_val, current_campus_val)
+    cols = [{"name": c, "id": c} for c in df_view.columns]
 
-    if FETCH_STATE["done"]:
-        loading_msg = f"Fetched ALL profiles: {len(cached_df)} total."
+    if fetch_state.get("done", False):
+        loading_msg = f"Fetched ALL profiles: {len(df_all)} total."
     else:
         loading_msg = (
-            f"Partial fetch: {len(df_view)} visible / {len(cached_df)} total rows so far. "
+            f"Partial fetch: {len(df_view)} visible / {len(df_all)} total rows so far. "
             "Auto-fetch is continuing…"
         )
 
-    # 5. Build enrollment & nomination filter options
+    # Build filter options
     enrollment_options = []
-    if "current_enrollment.admin_status" in cached_df.columns:
+    if "current_enrollment.admin_status" in df_all.columns:
         vals = (
-            cached_df["current_enrollment.admin_status"]
+            df_all["current_enrollment.admin_status"]
             .dropna()
             .astype(str)
             .unique()
@@ -1014,9 +999,9 @@ def fetch_profiles(n_clicks, n_intervals,
         enrollment_options = [{"label": v, "value": v} for v in vals]
 
     nomination_options = []
-    if "current_nomination.redeemed" in cached_df.columns:
+    if "current_nomination.redeemed" in df_all.columns:
         nvals = (
-            cached_df["current_nomination.redeemed"]
+            df_all["current_nomination.redeemed"]
             .dropna()
             .astype(str)
             .unique()
@@ -1025,12 +1010,11 @@ def fetch_profiles(n_clicks, n_intervals,
         nvals.sort()
         nomination_options = [{"label": v, "value": v} for v in nvals]
 
-    # Interval is enabled while fetching, disabled when done
-    interval_disabled = FETCH_STATE["done"]
+    interval_disabled = fetch_state.get("done", False)
 
     return (
         df_view.to_dict("records"),
-        columns,
+        cols,
         False,
         False,
         "\n".join(log_lines),
@@ -1040,10 +1024,12 @@ def fetch_profiles(n_clicks, n_intervals,
         nomination_options,
         [],
         interval_disabled,
+        fetch_state,
+        rows_store,
     )
 
 # -------------------------------------------------------------------------
-# FULL CSV DOWNLOAD
+# FULL CSV DOWNLOAD (uses cached rows from Store)
 # -------------------------------------------------------------------------
 @app.callback(
     Output("csv-file", "data"),
@@ -1051,15 +1037,23 @@ def fetch_profiles(n_clicks, n_intervals,
     State("campus-dd", "value"),
     State("birth-campus-dd", "value"),
     State("current-campus-dd", "value"),
+    State("store-cached-rows", "data"),
+    State("store-fetch-state", "data"),
     prevent_initial_call=True,
 )
-def download_csv(_, campus_val, birth_campus_val, current_campus_val):
-    if cached_df.empty:
+def download_csv(_, campus_val, birth_campus_val, current_campus_val,
+                 rows_store, fetch_state):
+    if not rows_store:
         return no_update
-    df_out = apply_campus_filters(
-        cached_df, campus_val, birth_campus_val, current_campus_val
-    )
-    return dcc.send_data_frame(df_out.to_csv, cached_name, index=False)
+
+    df_all = pd.DataFrame(rows_store)
+    df_out = apply_campus_filters(df_all, campus_val, birth_campus_val, current_campus_val)
+
+    if df_out.empty:
+        return no_update
+
+    filename = (fetch_state or {}).get("cached_name", "profiles_all.csv")
+    return dcc.send_data_frame(df_out.to_csv, filename, index=False)
 
 # -------------------------------------------------------------------------
 # FILTERED CSV DOWNLOAD
@@ -1073,17 +1067,21 @@ def download_csv(_, campus_val, birth_campus_val, current_campus_val):
     State("column-select", "value"),
     State("enrollment-status-dd", "value"),
     State("nomination-claimed-dd", "value"),
+    State("store-cached-rows", "data"),
+    State("store-fetch-state", "data"),
     prevent_initial_call=True,
 )
 def download_filtered_csv(
     _, campus_val, birth_campus_val, current_campus_val,
-    selected_fields, enrollment_status_vals, nomination_claimed_vals
+    selected_fields, enrollment_status_vals, nomination_claimed_vals,
+    rows_store, fetch_state
 ):
-    if cached_df.empty:
+    if not rows_store:
         return no_update
 
+    df_all = pd.DataFrame(rows_store)
     df_out = apply_campus_filters(
-        cached_df, campus_val, birth_campus_val, current_campus_val
+        df_all, campus_val, birth_campus_val, current_campus_val
     )
 
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
@@ -1100,6 +1098,9 @@ def download_filtered_csv(
     df_out = merge_carding_columns(df_out)
     df_out = add_level_category_column(df_out)
 
+    if df_out.empty:
+        return no_update
+
     if not selected_fields:
         selected_fields = FILTER_COLUMNS
 
@@ -1111,7 +1112,8 @@ def download_filtered_csv(
     rename_map = {field: FIELD_TO_LABEL.get(field, field) for field in fields}
     df_filtered.rename(columns=rename_map, inplace=True)
 
-    filename = cached_name.replace(".csv", "_filtered.csv")
+    filename = ((fetch_state or {}).get("cached_name", "profiles_all.csv")
+                .replace(".csv", "_filtered.csv"))
     return dcc.send_data_frame(df_filtered.to_csv, filename, index=False)
 
 # -------------------------------------------------------------------------
@@ -1126,6 +1128,7 @@ def download_filtered_csv(
     Input("column-select", "value"),
     Input("enrollment-status-dd", "value"),
     Input("nomination-claimed-dd", "value"),
+    State("store-cached-rows", "data"),
 )
 def update_filtered_preview(
     campus_val,
@@ -1134,12 +1137,14 @@ def update_filtered_preview(
     selected_fields,
     enrollment_status_vals,
     nomination_claimed_vals,
+    rows_store,
 ):
-    if cached_df.empty:
+    if not rows_store:
         return [], []
 
+    df_all = pd.DataFrame(rows_store)
     df_out = apply_campus_filters(
-        cached_df, campus_val, birth_campus_val, current_campus_val
+        df_all, campus_val, birth_campus_val, current_campus_val
     )
 
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
