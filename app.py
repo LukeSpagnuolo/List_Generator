@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-List Generator 5000 / 5001
+List Generator 5000
 Production-ready version using environment variables for deployment,
 with full UI (filters, previews, logs) and time-budgeted fetch.
 """
@@ -19,7 +19,7 @@ from dash_auth_external import DashAuthExternal
 from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ENV VARS (must match Posit secrets)
+# ENV VARS – must match Posit secrets
 # ──────────────────────────────────────────────────────────────────────────────
 
 SITE = os.environ.get("SITE", "https://apps.csipacific.ca")
@@ -34,8 +34,8 @@ PROFILES_URL = os.environ.get("PROFILES_URL", f"{SITE}/api/registration/profile/
 
 CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 
-# How long a single fetch click is allowed to run in total (seconds)
-MAX_FETCH_SECONDS = float(os.environ.get("MAX_FETCH_SECONDS", "25"))
+# Overall time budget per fetch click (seconds)
+MAX_FETCH_SECONDS = float(os.environ.get("MAX_FETCH_SECONDS", "20"))
 
 missing_env = [
     name for name, val in [
@@ -50,11 +50,11 @@ if missing_env:
 # ──────────────────────────────────────────────────────────────────────────────
 # Networking & retry tuning
 # ──────────────────────────────────────────────────────────────────────────────
-PAGE_LIMIT = 50            # per-page size for API
-MAX_RETRIES = 5
-BACKOFF_SEC = 1.5
-# Keep read timeout WELL under gunicorn worker timeout
-REQUEST_TIMEOUT = (5, 15)  # (connect, read) seconds
+PAGE_LIMIT = 50
+MAX_RETRIES = 3
+BACKOFF_SEC = 1.0
+# Keep read timeout VERY short so we never sit in ssl.read until gunicorn kills us
+REQUEST_TIMEOUT = (3, 5)  # (connect, read) seconds
 RETRYABLE_STATUSES = (502, 503, 504, 524)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -130,7 +130,6 @@ app = Dash(__name__, server=server)
 try:
     _city_df = pd.read_csv(CITY_MAP_PATH)
     _city_df = _city_df.dropna(subset=["Location Name", "Location Mapped Centre"])
-    # Normalise keys to avoid case/space issues
     _city_df["key_norm"] = (
         _city_df["Location Name"].astype(str).str.strip().str.lower()
     )
@@ -250,7 +249,7 @@ def flatten_profile(p, campus_id):
 def fetch_paginated(url, headers, log, deadline=None):
     """
     Fetch paginated DRF endpoint with:
-      - retries on 502/503/504/524 and timeouts
+      - retries on 502/503/504/524 + timeouts
       - total time budget via `deadline` (unix timestamp)
     """
     rows, page = [], 0
@@ -282,7 +281,7 @@ def fetch_paginated(url, headers, log, deadline=None):
                     log.append(
                         f"[page {page}] {status} → retry {retries+1}/{MAX_RETRIES}"
                     )
-                    time.sleep(wait + random.uniform(0, 0.5))
+                    time.sleep(wait + random.uniform(0, 0.3))
                     retries += 1
                     wait *= 2
                     continue
@@ -306,7 +305,7 @@ def fetch_paginated(url, headers, log, deadline=None):
                         f"[page {page}] timeout/conn {type(e).__name__} → "
                         f"retry {retries+1}/{MAX_RETRIES}"
                     )
-                    time.sleep(wait + random.uniform(0, 0.5))
+                    time.sleep(wait + random.uniform(0, 0.3))
                     retries += 1
                     wait *= 2
                     continue
@@ -444,7 +443,7 @@ def add_level_category(df: pd.DataFrame) -> pd.DataFrame:
       - Prov Dev 1/2/3 → Provincial Development
       - NSO Affiliated (Uncarded) → Canadian Development
       - SR, SR1, C, C1, D → Canadian Elite
-      - 'PSO Affiliated' (string match) → PSO Affiliated (Non Carded)
+      - 'PSO Affiliated' → PSO Affiliated (Non Carded)
     """
     col = "current_nomination.carding_level"
     if col not in df.columns:
@@ -487,7 +486,7 @@ def apply_campus_filters(df, campus_val, birth_campus_val, current_campus_val):
     return out
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Layout – same visual structure as your full version
+# Layout (same look as previous full version)
 # ──────────────────────────────────────────────────────────────────────────────
 app.layout = html.Div(
     style={"fontFamily": "Arial", "margin": "2rem"},
@@ -801,7 +800,6 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
         )
 
     headers = {"Authorization": f"Bearer {token}"}
-
     campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
 
     rows_total, flattened, log_lines = [], [], []
@@ -846,7 +844,6 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
 
     df = pd.DataFrame(flattened)
 
-    # Merge carding & add level category ONCE globally
     df = merge_carding_columns(df)
     df = add_level_category(df)
 
