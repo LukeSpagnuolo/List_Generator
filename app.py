@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-List Generator 5000
-Production-ready version using environment variables for deployment,
-with full UI (filters, previews, logs) and time-budgeted fetch.
+List Generator 5000 – Posit/Connect version
+- Uses environment variables for secrets/URLs
+- Chunked fetch to avoid worker timeouts
 """
 
 import os
@@ -18,48 +18,35 @@ from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
 from dash_auth_external import DashAuthExternal
 from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ENV VARS – must match Posit secrets
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# ENV VARIABLES (must match Posit configuration)
+# -------------------------------------------------------------------------
+CLIENT_ID = os.environ.get("CLIENT_ID")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
 
 SITE = os.environ.get("SITE", "https://apps.csipacific.ca")
 APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8050")
 
-CLIENT_ID = os.environ.get("CLIENT_ID")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-
 AUTH_URL = os.environ.get("AUTH_URL", f"{SITE}/o/authorize")
 TOKEN_URL = os.environ.get("TOKEN_URL", f"{SITE}/o/token/")
 PROFILES_URL = os.environ.get("PROFILES_URL", f"{SITE}/api/registration/profile/")
-
 CITY_MAP_PATH = os.environ.get("CITY_MAP_PATH", "Cities_Extended_Mapped.csv")
 
-# Overall time budget per fetch click (seconds)
-MAX_FETCH_SECONDS = float(os.environ.get("MAX_FETCH_SECONDS", "20"))
-
-missing_env = [
-    name for name, val in [
-        ("CLIENT_ID", CLIENT_ID),
-        ("CLIENT_SECRET", CLIENT_SECRET),
-    ]
-    if not val
-]
-if missing_env:
-    print("⚠️ Missing required environment variables:", ", ".join(missing_env))
-
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 # Networking & retry tuning
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 PAGE_LIMIT = 50
-MAX_RETRIES = 3
-BACKOFF_SEC = 1.0
-# Keep read timeout VERY short so we never sit in ssl.read until gunicorn kills us
-REQUEST_TIMEOUT = (3, 5)  # (connect, read) seconds
+MAX_RETRIES = 5
+BACKOFF_SEC = 1.5
+REQUEST_TIMEOUT = (3, 5)  # (connect timeout, read timeout) in seconds
 RETRYABLE_STATUSES = (502, 503, 504, 524)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Campus & role options
-# ──────────────────────────────────────────────────────────────────────────────
+# Time budget per FETCH click to avoid worker timeout
+MAX_FETCH_SECONDS = 15  # stay well below Connect/Gunicorn timeout
+
+# -------------------------------------------------------------------------
+# CAMPUS OPTIONS
+# -------------------------------------------------------------------------
 CAMPUS_OPTS = [
     {"label": "CSI Pacific - Victoria",           "value": 1},
     {"label": "CSI Pacific - Vancouver",          "value": 2},
@@ -81,6 +68,9 @@ CAMPUS_LABEL_MAP = {
     if isinstance(opt["value"], int)
 }
 
+# -------------------------------------------------------------------------
+# ROLE OPTIONS
+# -------------------------------------------------------------------------
 ROLE_OPTS = [
     {"label": "(all roles)", "value": ""},
     {"label": "Athlete", "value": "athlete"},
@@ -89,9 +79,9 @@ ROLE_OPTS = [
 ]
 ROLE_ID_MAP = {"athlete": 1, "coach": 2, "staff": 4}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Carding map
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# CARDING MAP
+# -------------------------------------------------------------------------
 CARDING_MAP = {
     1: "SR",
     2: "SRI",
@@ -111,46 +101,40 @@ CARDING_MAP = {
     16: "PSO Affiliated (Uncarded)",
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Auth & app init
-# ──────────────────────────────────────────────────────────────────────────────
-auth = DashAuthExternal(
-    AUTH_URL,
-    TOKEN_URL,
-    app_url=APP_URL,
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
-)
-server = auth.server
-app = Dash(__name__, server=server)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# City → Campus mapping
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# CITY → CAMPUS MAPPING (from Cities_Extended_Mapped.csv)
+# -------------------------------------------------------------------------
 try:
     _city_df = pd.read_csv(CITY_MAP_PATH)
     _city_df = _city_df.dropna(subset=["Location Name", "Location Mapped Centre"])
+
+    # Normalise keys for robust matching
     _city_df["key_norm"] = (
-        _city_df["Location Name"].astype(str).str.strip().str.lower()
+        _city_df["Location Name"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
     )
+
     CITY_TO_CAMPUS = (
         _city_df
         .drop_duplicates(subset=["key_norm"])
         .set_index("key_norm")["Location Mapped Centre"]
         .to_dict()
     )
+
     MAPPED_CAMPUS_NAMES = sorted(set(CITY_TO_CAMPUS.values()))
     CITY_MAP_STATUS = f"Loaded {len(CITY_TO_CAMPUS)} city→campus mappings."
 except Exception as e:
     CITY_TO_CAMPUS = {}
     MAPPED_CAMPUS_NAMES = []
     CITY_MAP_STATUS = f"ERROR loading city map: {e}"
-    print("⚠️", CITY_MAP_STATUS)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Flatten helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# SAFE STRING + UNIVERSAL FLATTENING
+# -------------------------------------------------------------------------
 def safe_str(v):
+    """Convert any complex or None values to a safe string for DataTable/CSV."""
     if v is None:
         return ""
     if isinstance(v, (str, int, float, bool)):
@@ -160,8 +144,8 @@ def safe_str(v):
     except Exception:
         return str(v)
 
-
 def flatten_json(data, prefix=""):
+    """Recursively flatten dicts/lists with dot notation, handling all types."""
     out = {}
     if isinstance(data, dict):
         for k, v in data.items():
@@ -173,8 +157,8 @@ def flatten_json(data, prefix=""):
         out[prefix] = safe_str(data)
     return out
 
-
 def _coerce_int(val):
+    """Return int(val) if possible, else None."""
     if val is None:
         return None
     try:
@@ -183,8 +167,12 @@ def _coerce_int(val):
     except Exception:
         return None
 
-
 def derive_carding_columns(flat: dict) -> dict:
+    """
+    Look for a carding level id in common flattened keys and add:
+      - carding_level_id (string)
+      - carding_level_mapped (human-readable)
+    """
     candidate_keys = [
         "carding_level", "carding_level_id", "carding.id",
         "carding_level.pk", "carding_pk", "athlete.carding_level_id",
@@ -208,15 +196,20 @@ def derive_carding_columns(flat: dict) -> dict:
 
     return flat
 
-
-def flatten_profile(p, campus_id):
+def flatten_profile(p, campus_id: int) -> dict:
+    """
+    Fully flatten profile including all nested content + campus/carding mapping,
+    and add campus_by_birth / current_campus using the city → campus mapping.
+    """
     flat = flatten_json(p)
 
+    # API / nomination campus from profile
     flat["campus_id"] = str(campus_id)
     flat["campus_label"] = CAMPUS_LABEL_MAP.get(
         campus_id, f"Unknown ({campus_id})"
     )
 
+    # Map birth & residence city → "Location Mapped Centre"
     birth_city = (
         flat.get("birth_city.name")
         or flat.get("person.birth_city.name")
@@ -230,6 +223,7 @@ def flatten_profile(p, campus_id):
         or ""
     )
 
+    # Normalise for lookup (lower + strip)
     birth_key = birth_city.strip().lower() if birth_city else ""
     res_key = res_city.strip().lower() if res_city else ""
 
@@ -243,93 +237,103 @@ def flatten_profile(p, campus_id):
     flat = derive_carding_columns(flat)
     return flat
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Paginated fetch with time budget
-# ──────────────────────────────────────────────────────────────────────────────
-def fetch_paginated(url, headers, log, deadline=None):
+# -------------------------------------------------------------------------
+# CHUNKED FETCH (to avoid timeouts)
+# -------------------------------------------------------------------------
+def fetch_paginated_chunk(url, headers, log, deadline):
     """
-    Fetch paginated DRF endpoint with:
-      - retries on 502/503/504/524 + timeouts
-      - total time budget via `deadline` (unix timestamp)
+    Fetch a *chunk* of a DRF paginated endpoint.
+
+    - Stops when:
+        • we run out of pages for this campus, OR
+        • we hit the time budget (past `deadline`).
+
+    Returns
+    -------
+    rows : list
+        New rows fetched in this chunk.
+    next_url : str or None
+        DRF "next" URL to continue from, or None if this campus is finished.
     """
-    rows, page = [], 0
+    rows = []
     session = requests.Session()
 
-    while url:
-        if deadline and time.time() >= deadline:
-            log.append(f"[page {page}] Stopping fetch: hit time budget.")
-            return rows
-
+    while url and time.time() < deadline:
         if "limit=" not in url:
             url += ("&" if "?" in url else "?") + f"limit={PAGE_LIMIT}"
 
-        page += 1
         retries, wait = 0, BACKOFF_SEC
 
         while True:
-            if deadline and time.time() >= deadline:
-                log.append(
-                    f"[page {page}] Aborting mid-page: time budget exceeded."
-                )
-                return rows
-
             try:
                 resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
                 status = resp.status_code
-
-                if status in RETRYABLE_STATUSES and retries < MAX_RETRIES:
-                    log.append(
-                        f"[page {page}] {status} → retry {retries+1}/{MAX_RETRIES}"
-                    )
-                    time.sleep(wait + random.uniform(0, 0.3))
-                    retries += 1
-                    wait *= 2
-                    continue
-
-                if status != 200:
-                    log.append(
-                        f"[page {page}] non-200 status {status}\n"
-                        f"{resp.text[:300]}"
-                    )
-                    return rows
-
-                data = resp.json()
-                rows.extend(data.get("results", []))
-                url = data.get("next")
-                log.append(f"[page {page}] OK, rows so far: {len(rows)}")
-                break
-
             except (ReadTimeout, ConnectTimeout, ConnectionError) as e:
                 if retries < MAX_RETRIES:
                     log.append(
-                        f"[page {page}] timeout/conn {type(e).__name__} → "
-                        f"retry {retries+1}/{MAX_RETRIES}"
+                        f"timeout/conn error on {url}: {type(e).__name__} "
+                        f"→ retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
                     )
-                    time.sleep(wait + random.uniform(0, 0.3))
+                    time.sleep(wait + random.uniform(0, 0.5))
                     retries += 1
                     wait *= 2
                     continue
+                else:
+                    log.append(
+                        f"giving up on {url} after {MAX_RETRIES} retries: "
+                        f"{type(e).__name__}"
+                    )
+                    return rows, url  # keep what we have; try again next click
+
+            # If we got here, we have a response
+            if status in RETRYABLE_STATUSES and retries < MAX_RETRIES:
                 log.append(
-                    f"[page {page}] giving up after {MAX_RETRIES} retries: {e}"
+                    f"{url} • {status} (retryable) "
+                    f"→ retry {retries+1}/{MAX_RETRIES} in {wait:.1f}s"
                 )
-                return rows
+                time.sleep(wait + random.uniform(0, 0.5))
+                retries += 1
+                wait *= 2
+                continue
 
-            except Exception as e:
-                log.append(
-                    f"[page {page}] unexpected error: {type(e).__name__}: {e}"
-                )
-                return rows
+            if status != 200:
+                log.append(f"{url} • {status}\n{resp.text[:300]}")
+                return rows, None
 
-    return rows
+            data = resp.json()
+            batch = data.get("results", [])
+            rows.extend(batch)
+            url = data.get("next")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Global cache
-# ──────────────────────────────────────────────────────────────────────────────
+            # stop if there is no next page
+            if not url:
+                return rows, None
+
+            # or if we're out of time
+            if time.time() >= deadline:
+                return rows, url
+
+            # otherwise loop to next page (no extra retries needed)
+            break
+
+    return rows, url
+
+# -------------------------------------------------------------------------
+# GLOBAL CACHE & FETCH STATE
+# -------------------------------------------------------------------------
 cached_df, cached_name = pd.DataFrame(), ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Export column specs
-# ──────────────────────────────────────────────────────────────────────────────
+FETCH_STATE = {
+    "campus_ids": [],
+    "current_index": 0,
+    "next_url": None,
+    "done": True,
+    "total_rows": 0,
+}
+
+# -------------------------------------------------------------------------
+# EXPORT COLUMN SPECS (field name → pretty label)
+# -------------------------------------------------------------------------
 EXPORT_COLUMNS = [
     ("role_slug",                          "role"),
     ("person.first_name",                  "First Name"),
@@ -379,9 +383,9 @@ FILTER_COLUMNS = [field for field, _ in EXPORT_COLUMNS]
 FIELD_TO_LABEL = {field: label for field, label in EXPORT_COLUMNS}
 LABEL_TO_FIELD = {label: field for field, label in EXPORT_COLUMNS}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Test sports filter
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# TEST SPORTS TO EXCLUDE FROM FILTERED DOWNLOAD
+# -------------------------------------------------------------------------
 TEST_SPORTS = {
     "Cinderball (TEST)",
     "Skimboarding Cross (TEST)",
@@ -389,6 +393,10 @@ TEST_SPORTS = {
 TEST_SPORTS_NORMALIZED = {s.strip().lower() for s in TEST_SPORTS}
 
 def remove_test_sports(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove rows where any of the sport columns indicate TEST sports.
+    Checks both internal and pretty column names, case-insensitive.
+    """
     if df.empty:
         return df
 
@@ -414,10 +422,15 @@ def remove_test_sports(df: pd.DataFrame) -> pd.DataFrame:
 
     return df[mask]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Carding merge + Level Category
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# MERGE CARDING COLUMNS + LEVEL CATEGORY
+# -------------------------------------------------------------------------
 def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Use carding_level_mapped to fill in any missing
+    current_nomination.carding_level values where possible.
+    Operates in-place and also returns df for convenience.
+    """
     nom_col = "current_nomination.carding_level"
     map_col = "carding_level_mapped"
 
@@ -427,6 +440,7 @@ def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
     nom = df[nom_col].astype(str).str.strip()
     mapped = df[map_col].astype(str).str.strip()
 
+    # Treat empty strings and "nan" as missing
     nom_clean = nom.replace("nan", "")
     is_missing = nom_clean.eq("")
     has_mapped = mapped.ne("")
@@ -436,61 +450,87 @@ def merge_carding_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-def add_level_category(df: pd.DataFrame) -> pd.DataFrame:
+def add_level_category_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Level Category from nomination card level (after merge_carding_columns):
-      - Prov Dev 1/2/3 → Provincial Development
-      - NSO Affiliated (Uncarded) → Canadian Development
-      - SR, SR1, C, C1, D → Canadian Elite
-      - 'PSO Affiliated' → PSO Affiliated (Non Carded)
+    Add 'level_category' based on current_nomination.carding_level (text).
+    Rules:
+    - Prov Dev 1/2/3 → Provincial Development
+    - NSO Affiliated (Uncarded) → Canadian Development
+    - SR, SR1, SR2, C, C1, D, SRI, DI, C1I → Canadian Elite
+    - PSO Affiliated (any) → PSO Affiliated (Non Carded)
     """
-    col = "current_nomination.carding_level"
-    if col not in df.columns:
+    nom_col = "current_nomination.carding_level"
+    if nom_col not in df.columns:
         df["level_category"] = ""
         return df
 
-    vals = df[col].astype(str).str.strip()
+    s = df[nom_col].astype(str).str.strip()
+    categories = []
 
-    def categorize(x: str) -> str:
-        if x in {"Prov Dev 1", "Prov Dev 2", "Prov Dev 3"}:
-            return "Provincial Development"
-        if x == "NSO Affiliated (Uncarded)":
-            return "Canadian Development"
-        if x in {"SR", "SR1", "C", "C1", "D"}:
-            return "Canadian Elite"
-        if "PSO Affiliated" in x:
-            return "PSO Affiliated (Non Carded)"
-        return ""
+    for val in s:
+        lv = val.lower()
+        if lv in {"prov dev 1", "prov dev 2", "prov dev 3"}:
+            categories.append("Provincial Development")
+        elif "nso affiliated" in lv and "uncarded" in lv:
+            categories.append("Canadian Development")
+        elif lv in {"sr", "sr1", "sr2", "c", "c1", "d", "sri", "di", "c1i"}:
+            categories.append("Canadian Elite")
+        elif "pso affiliated" in lv:
+            categories.append("PSO Affiliated (Non Carded)")
+        else:
+            categories.append("")
 
-    df["level_category"] = vals.map(categorize)
+    df["level_category"] = categories
     return df
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Campus filter
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# CAMPUS FILTER HELPER
+# -------------------------------------------------------------------------
 def apply_campus_filters(df, campus_val, birth_campus_val, current_campus_val):
+    """
+    Apply three campus-based filters to a DataFrame:
+      - campus_val          → filters by API campus (campus_label column)
+      - birth_campus_val    → filters by mapped birth campus (campus_by_birth)
+      - current_campus_val  → filters by mapped current campus (current_campus)
+    Empty/None values mean "no filter" for that dimension.
+    """
     out = df
 
+    # Filter by API campus / campus_label (using campus id)
     if isinstance(campus_val, int) and "campus_label" in out.columns:
         label = CAMPUS_LABEL_MAP.get(campus_val)
         if label:
             out = out[out["campus_label"] == label]
 
+    # Filter by mapped birth campus
     if birth_campus_val and "campus_by_birth" in out.columns:
         out = out[out["campus_by_birth"] == birth_campus_val]
 
+    # Filter by mapped current campus (residence)
     if current_campus_val and "current_campus" in out.columns:
         out = out[out["current_campus"] == current_campus_val]
 
     return out
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Layout (same look as previous full version)
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# APP INITIALISATION
+# -------------------------------------------------------------------------
+auth = DashAuthExternal(
+    AUTH_URL, TOKEN_URL,
+    app_url=APP_URL,
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+)
+server = auth.server
+app = Dash(__name__, server=server)
+
+# -------------------------------------------------------------------------
+# LAYOUT
+# -------------------------------------------------------------------------
 app.layout = html.Div(
     style={"fontFamily": "Arial", "margin": "2rem"},
     children=[
+        # Title & subtitle
         html.H1(
             "List Generator 5000",
             style={
@@ -508,6 +548,7 @@ app.layout = html.Div(
             },
         ),
 
+        # Campus + role filters + Fetch button
         html.Div(
             [
                 dcc.Dropdown(
@@ -564,6 +605,7 @@ app.layout = html.Div(
             },
         ),
 
+        # Data preview section (loading + main preview table)
         dcc.Loading(
             id="loading-spinner",
             type="circle",
@@ -608,6 +650,7 @@ app.layout = html.Div(
             ],
         ),
 
+        # Download options section
         html.Hr(style={"marginTop": "1.8rem", "marginBottom": "1rem"}),
         html.H3(
             "Download options",
@@ -618,6 +661,7 @@ app.layout = html.Div(
             },
         ),
 
+        # Filtered CSV preview
         html.Div(
             "Filtered CSV preview (first 10 rows)",
             style={
@@ -652,6 +696,7 @@ app.layout = html.Div(
             ],
         ),
 
+        # Download buttons
         html.Div(
             [
                 html.Button(
@@ -683,6 +728,7 @@ app.layout = html.Div(
             },
         ),
 
+        # Column multiselect for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -700,6 +746,7 @@ app.layout = html.Div(
             style={"marginBottom": "0.6rem"},
         ),
 
+        # Enrollment status filter for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -707,13 +754,16 @@ app.layout = html.Div(
                     options=[],
                     value=[],
                     multi=True,
-                    placeholder="Filter by enrollment status for filtered CSV (optional)",
+                    placeholder=(
+                        "Filter by enrollment status for filtered CSV (optional)"
+                    ),
                     style={"width": "100%"},
                 )
             ],
             style={"marginBottom": "0.6rem"},
         ),
 
+        # Nomination claimed filter for filtered CSV
         html.Div(
             [
                 dcc.Dropdown(
@@ -721,13 +771,16 @@ app.layout = html.Div(
                     options=[],
                     value=[],
                     multi=True,
-                    placeholder="Filter by nomination claimed for filtered CSV (optional)",
+                    placeholder=(
+                        "Filter by nomination claimed for filtered CSV (optional)"
+                    ),
                     style={"width": "100%"},
                 )
             ],
             style={"marginBottom": "0.8rem"},
         ),
 
+        # Collapsible technical log
         html.Details(
             [
                 html.Summary(
@@ -762,9 +815,9 @@ app.layout = html.Div(
     ],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Callbacks
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
+# CALLBACKS
+# -------------------------------------------------------------------------
 @app.callback(
     Output("preview", "data"),
     Output("preview", "columns"),
@@ -783,7 +836,9 @@ app.layout = html.Div(
     State("role-dd", "value"),
     prevent_initial_call=True,
 )
-def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val):
+def fetch_profiles(n_clicks, campus_val, birth_campus_val, current_campus_val, role_val):
+    global cached_df, cached_name, FETCH_STATE
+
     token = auth.get_token()
     if not token:
         return (
@@ -800,88 +855,162 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
         )
 
     headers = {"Authorization": f"Bearer {token}"}
-    campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
+    log_lines = [CITY_MAP_STATUS]
 
-    rows_total, flattened, log_lines = [], [], []
+    # ---------- 1. Initialise or continue FETCH_STATE ----------
+    if FETCH_STATE["done"] or n_clicks == 1:
+        campus_ids = [o["value"] for o in CAMPUS_OPTS if isinstance(o["value"], int)]
+        FETCH_STATE = {
+            "campus_ids": campus_ids,
+            "current_index": 0,
+            "next_url": None,
+            "done": False,
+            "total_rows": 0,
+        }
+        cached_df = pd.DataFrame()
+        campus_tag = "all"
+        cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
+        log_lines.append("Starting NEW full fetch cycle.")
+    else:
+        log_lines.append(
+            f"Continuing fetch at campus index "
+            f"{FETCH_STATE['current_index']} of {len(FETCH_STATE['campus_ids'])}."
+        )
 
-    log_lines.append(CITY_MAP_STATUS)
-    start = time.time()
-    deadline = start + MAX_FETCH_SECONDS
+    campus_ids = FETCH_STATE["campus_ids"]
+    idx = FETCH_STATE["current_index"]
+    next_url = FETCH_STATE["next_url"]
 
-    for cid in campus_ids:
-        if time.time() >= deadline:
-            log_lines.append(
-                f"Global time budget hit after campus {cid-1}, "
-                f"stopping further campuses."
-            )
-            break
-
-        role_id = ROLE_ID_MAP.get(role_val, "")
-        url = f"{PROFILES_URL}?campus_id={cid}"
-        if role_id:
-            url += f"&role_id={role_id}"
-
-        log_lines.append(f"\nCampus {cid}, role='{role_val or 'all'}'")
-        batch = fetch_paginated(url, headers, log_lines, deadline=deadline)
-        for r in batch:
-            flattened.append(flatten_profile(r, cid))
-            rows_total.append(r)
-        log_lines.append(f"  added {len(batch)} rows (running total {len(rows_total)})")
-
-    if not flattened:
+    if not campus_ids:
+        log_lines.append("No campus IDs available.")
         return (
             [],
             [],
             True,
             True,
             "\n".join(log_lines),
-            "No profiles found (or time budget hit before any page completed).",
+            "No campuses configured.",
             [],
             [],
             [],
             [],
         )
 
-    df = pd.DataFrame(flattened)
+    # ---------- 2. Time budget for this click ----------
+    start = time.time()
+    deadline = start + MAX_FETCH_SECONDS
+    new_flattened_rows = []
 
-    df = merge_carding_columns(df)
-    df = add_level_category(df)
+    # ---------- 3. Loop over campuses within time budget ----------
+    while time.time() < deadline and idx < len(campus_ids):
+        cid = campus_ids[idx]
+        role_id = ROLE_ID_MAP.get(role_val, "")
 
-    global cached_df, cached_name
-    cached_df = df.copy()
-    campus_tag = "all"
-    cached_name = f"profiles_{campus_tag}{'_'+role_val if role_val else ''}.csv"
+        if not next_url:
+            base_url = f"{PROFILES_URL}?campus_id={cid}"
+            if role_id:
+                base_url += f"&role_id={role_id}"
+            next_url = base_url
 
-    df_view = apply_campus_filters(df, campus_val, birth_campus_val, current_campus_val)
+        log_lines.append(
+            f"Campus {cid} ({idx+1}/{len(campus_ids)}), starting from: {next_url}"
+        )
+
+        rows, new_next = fetch_paginated_chunk(next_url, headers, log_lines, deadline)
+
+        for r in rows:
+            new_flattened_rows.append(flatten_profile(r, cid))
+
+        FETCH_STATE["total_rows"] += len(rows)
+
+        if new_next:
+            # still more pages for this campus
+            FETCH_STATE["next_url"] = new_next
+            log_lines.append(
+                f"Campus {cid}: fetched {len(rows)} rows this click, more pages remain."
+            )
+            break
+        else:
+            # campus finished
+            log_lines.append(
+                f"Campus {cid}: completed (fetched {len(rows)} rows this click)."
+            )
+            idx += 1
+            FETCH_STATE["current_index"] = idx
+            FETCH_STATE["next_url"] = None
+            next_url = None
+
+            if idx >= len(campus_ids):
+                FETCH_STATE["done"] = True
+                log_lines.append(
+                    f"All campuses fetched. Total rows so far: {FETCH_STATE['total_rows']}."
+                )
+                break
+
+    # ---------- 4. Update cached_df with newly fetched rows ----------
+    if new_flattened_rows:
+        df_new = pd.DataFrame(new_flattened_rows)
+        if cached_df.empty:
+            cached_df = df_new
+        else:
+            cached_df = (
+                pd.concat([cached_df, df_new], ignore_index=True)
+                .drop_duplicates()
+            )
+    else:
+        log_lines.append("No new rows fetched this click.")
+
+    if cached_df.empty:
+        loading_msg = "No profiles fetched yet. Click Fetch to start."
+        return (
+            [],
+            [],
+            True,
+            True,
+            "\n".join(log_lines),
+            loading_msg,
+            [],
+            [],
+            [],
+            [],
+        )
+
+    # ---------- 5. Apply campus filters for preview ----------
+    df_view = apply_campus_filters(cached_df, campus_val, birth_campus_val, current_campus_val)
 
     columns = [{"name": c, "id": c} for c in df_view.columns]
-    loading_msg = (
-        f"Fetched {len(df_view)} profiles (from {len(df)} total) "
-        f"in {time.time() - start:.1f}s."
-    )
 
+    if FETCH_STATE["done"]:
+        loading_msg = f"Fetched ALL profiles: {len(cached_df)} total."
+    else:
+        loading_msg = (
+            f"Partial fetch: {len(df_view)} visible / {len(cached_df)} total rows so far. "
+            "Click Fetch again to continue."
+        )
+
+    # ---------- 6. Build enrollment & nomination filter options ----------
     enrollment_options = []
-    if "current_enrollment.admin_status" in df.columns:
+    if "current_enrollment.admin_status" in cached_df.columns:
         vals = (
-            df["current_enrollment.admin_status"]
+            cached_df["current_enrollment.admin_status"]
             .dropna()
             .astype(str)
             .unique()
             .tolist()
         )
-        vals = sorted(vals)
+        vals.sort()
         enrollment_options = [{"label": v, "value": v} for v in vals]
 
     nomination_options = []
-    if "current_nomination.redeemed" in df.columns:
+    if "current_nomination.redeemed" in cached_df.columns:
         nvals = (
-            df["current_nomination.redeemed"]
+            cached_df["current_nomination.redeemed"]
             .dropna()
             .astype(str)
             .unique()
             .tolist()
         )
-        nvals = sorted(nvals)
+        nvals.sort()
         nomination_options = [{"label": v, "value": v} for v in nvals]
 
     return (
@@ -897,6 +1026,9 @@ def fetch_profiles(_, campus_val, birth_campus_val, current_campus_val, role_val
         [],
     )
 
+# -------------------------------------------------------------------------
+# FULL CSV DOWNLOAD (no extra filters except campus)
+# -------------------------------------------------------------------------
 @app.callback(
     Output("csv-file", "data"),
     Input("btn-dl", "n_clicks"),
@@ -913,6 +1045,9 @@ def download_csv(_, campus_val, birth_campus_val, current_campus_val):
     )
     return dcc.send_data_frame(df_out.to_csv, cached_name, index=False)
 
+# -------------------------------------------------------------------------
+# FILTERED CSV DOWNLOAD
+# -------------------------------------------------------------------------
 @app.callback(
     Output("csv-file-filtered", "data"),
     Input("btn-dl-filter", "n_clicks"),
@@ -935,20 +1070,26 @@ def download_filtered_csv(
         cached_df, campus_val, birth_campus_val, current_campus_val
     )
 
+    # Enrollment status filter
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
         df_out = df_out[
             df_out["current_enrollment.admin_status"].astype(str).isin(enrollment_status_vals)
         ]
 
+    # Nomination claimed filter
     if nomination_claimed_vals and "current_nomination.redeemed" in df_out.columns:
         df_out = df_out[
             df_out["current_nomination.redeemed"].astype(str).isin(nomination_claimed_vals)
         ]
 
+    # Remove TEST sports
     df_out = remove_test_sports(df_out)
-    df_out = merge_carding_columns(df_out)
-    df_out = add_level_category(df_out)
 
+    # Merge carding + level category
+    df_out = merge_carding_columns(df_out)
+    df_out = add_level_category_column(df_out)
+
+    # Columns
     if not selected_fields:
         selected_fields = FILTER_COLUMNS
 
@@ -957,12 +1098,16 @@ def download_filtered_csv(
         return no_update
 
     df_filtered = df_out[fields].copy()
+
     rename_map = {field: FIELD_TO_LABEL.get(field, field) for field in fields}
     df_filtered.rename(columns=rename_map, inplace=True)
 
     filename = cached_name.replace(".csv", "_filtered.csv")
     return dcc.send_data_frame(df_filtered.to_csv, filename, index=False)
 
+# -------------------------------------------------------------------------
+# FILTERED PREVIEW (first 10 rows)
+# -------------------------------------------------------------------------
 @app.callback(
     Output("filtered-preview", "data"),
     Output("filtered-preview", "columns"),
@@ -988,19 +1133,24 @@ def update_filtered_preview(
         cached_df, campus_val, birth_campus_val, current_campus_val
     )
 
+    # Enrollment status filter
     if enrollment_status_vals and "current_enrollment.admin_status" in df_out.columns:
         df_out = df_out[
             df_out["current_enrollment.admin_status"].astype(str).isin(enrollment_status_vals)
         ]
 
+    # Nomination claimed filter
     if nomination_claimed_vals and "current_nomination.redeemed" in df_out.columns:
         df_out = df_out[
             df_out["current_nomination.redeemed"].astype(str).isin(nomination_claimed_vals)
         ]
 
+    # Remove TEST sports
     df_out = remove_test_sports(df_out)
+
+    # Merge carding + level category
     df_out = merge_carding_columns(df_out)
-    df_out = add_level_category(df_out)
+    df_out = add_level_category_column(df_out)
 
     if df_out.empty:
         return [], []
@@ -1013,6 +1163,7 @@ def update_filtered_preview(
         return [], []
 
     df_filtered = df_out[fields].copy()
+
     rename_map = {field: FIELD_TO_LABEL.get(field, field) for field in fields}
     df_filtered.rename(columns=rename_map, inplace=True)
 
@@ -1022,6 +1173,6 @@ def update_filtered_preview(
 
     return data, columns
 
-# ──────────────────────────────────────────────────────────────────────────────
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(debug=True, port=8050)
