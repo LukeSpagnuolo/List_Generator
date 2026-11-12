@@ -323,7 +323,7 @@ TEST_SPORTS = {"cinderball (test)", "skimboarding cross (test)"}
 CONVERSION_GITHUB = GitHubSource(
     repo=os.environ.get("CONVERSION_GITHUB_REPO", "LukeSpagnuolo/Conversion"),
     branch=os.environ.get("CONVERSION_GITHUB_BRANCH", "main"),
-    path=os.environ.get("CONVERSION_GITHUB_PATH", "Conversion_Data_2026_final.csv"),
+    path=os.environ.get("CONVERSION_GITHUB_PATH", "Conversion_Data.csv"),
     token=os.environ.get("GITHUB_TOKEN", ""),
 )
 
@@ -3343,7 +3343,7 @@ def download_conversion_update(
     except ValueError as exc:
         return no_update, html.Div(str(exc), className="status error")
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    content = build_update_zip(result, excluded, conversion.get("filename") or "Conversion_Data_2026_final.csv", saved)
+    content = build_update_zip(result, excluded, conversion.get("filename") or "Conversion_Data.csv", saved)
     return dcc.send_bytes(content, f"conversion_update_{stamp}.zip"), _result_messages(result)
 
 

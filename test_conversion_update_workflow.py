@@ -231,19 +231,19 @@ class MatchAndApplyTests(unittest.TestCase):
     def test_upload_round_trip_and_zip(self):
         ds = dataset([ds_row("Ana", "Row", "Rowing", 2026, "Prov Dev 2", "2008-01-01")]).drop(columns="Profile_ID")
         encoded = "data:text/csv;base64," + base64.b64encode(ds.to_csv(index=False).encode()).decode()
-        loaded = cu.read_conversion_csv(encoded, "Conversion_Data_2026_final.csv")
+        loaded = cu.read_conversion_csv(encoded, "Conversion_Data.csv")
         self.assertIn("Profile_ID", loaded)
         with self.assertRaises(ValueError):
             cu.read_conversion_csv("data:text/csv;base64," + base64.b64encode(b"a,b\n1,2\n").decode(), "x.csv")
         plan, excluded, result = run(loaded, [nomination("Ana", "Row", "Rowing", "2026-2027", "Prov Dev 1", "2008-01-01")])
-        archive = zipfile.ZipFile(io.BytesIO(cu.build_update_zip(result, excluded, "Conversion_Data_2026_final.csv")))
+        archive = zipfile.ZipFile(io.BytesIO(cu.build_update_zip(result, excluded, "Conversion_Data.csv")))
         self.assertEqual(
             sorted(archive.namelist()),
-            sorted(["Conversion_Data_2026_final.csv", "conversion_update_changes.csv",
+            sorted(["Conversion_Data.csv", "conversion_update_changes.csv",
                     "conversion_update_held_for_review.csv", "conversion_update_excluded.csv",
                     cu.DECISIONS_FILENAME]),
         )
-        written = pd.read_csv(archive.open("Conversion_Data_2026_final.csv"), dtype=str, keep_default_na=False)
+        written = pd.read_csv(archive.open("Conversion_Data.csv"), dtype=str, keep_default_na=False)
         self.assertEqual(list(written.columns), cu.DATASET_COLUMNS + ["Profile_ID"])
         self.assertEqual(len(written), 2)
 
@@ -439,8 +439,8 @@ class GitHubSourceTests(unittest.TestCase):
         self.assertEqual(len(frame), 1)
         self.assertEqual(info["sha"], "abc1234def")
         self.assertEqual(info["message"], "Add 2027 nominations")
-        self.assertIn("/abc1234def/Conversion_Data_2026_final.csv", session.calls[1][0])
-        self.assertEqual(session.calls[0][1]["params"]["path"], "Conversion_Data_2026_final.csv")
+        self.assertIn("/abc1234def/Conversion_Data.csv", session.calls[1][0])
+        self.assertEqual(session.calls[0][1]["params"]["path"], "Conversion_Data.csv")
         self.assertNotIn("Authorization", session.calls[0][1]["headers"])
 
     def test_token_is_sent_when_set(self):
@@ -480,7 +480,7 @@ class GitHubPushTests(unittest.TestCase):
         self.assertEqual(pushed["sha"], "new333")
         tree_call = session.calls[4]
         self.assertEqual(tree_call[2]["json"]["base_tree"], "tree789")
-        self.assertEqual(tree_call[2]["json"]["tree"][0]["path"], "Conversion_Data_2026_final.csv")
+        self.assertEqual(tree_call[2]["json"]["tree"][0]["path"], "Conversion_Data.csv")
         commit_call = session.calls[5]
         self.assertEqual(commit_call[2]["json"]["parents"], ["head456"])
         patch_call = session.calls[6]
@@ -495,7 +495,7 @@ class GitHubPushTests(unittest.TestCase):
                                      extra_files={self.SOURCE.decisions_path: b"Decision,Dataset key\n"})
         tree = session.calls[5][2]["json"]["tree"]
         self.assertEqual([entry["path"] for entry in tree],
-                         ["Conversion_Data_2026_final.csv", "conversion_review_decisions.csv"])
+                         ["Conversion_Data.csv", "conversion_review_decisions.csv"])
         self.assertEqual(cu.GitHubSource(path="data/x.csv").decisions_path, "data/conversion_review_decisions.csv")
 
     def test_missing_decisions_file_is_empty(self):

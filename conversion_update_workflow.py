@@ -1,4 +1,4 @@
-"""Add Registration nominations to the Conversion dataset (Conversion_Data_2026_final.csv).
+"""Add Registration nominations to the Conversion dataset (Conversion_Data.csv).
 
 Rules (agreed with the data owner, Nov 2026; see the Conversion repo's
 DATA_CLEANUP_2026-11-06.md and scripts/clean_dataset.py):
@@ -274,7 +274,7 @@ def merge_decisions(saved: pd.DataFrame | None, new: pd.DataFrame | None) -> pd.
 class GitHubSource:
     repo: str = "LukeSpagnuolo/Conversion"
     branch: str = "main"
-    path: str = "Conversion_Data_2026_final.csv"
+    path: str = "Conversion_Data.csv"
     token: str = ""
 
     @property
@@ -1146,7 +1146,7 @@ def build_update_zip(
     """``decisions``: every saved review decision (earlier ones plus this run's), to load next time."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(dataset_filename or "Conversion_Data_2026_final.csv", result.dataset.to_csv(index=False))
+        archive.writestr(dataset_filename or "Conversion_Data.csv", result.dataset.to_csv(index=False))
         archive.writestr("conversion_update_changes.csv", result.changes.to_csv(index=False))
         archive.writestr("conversion_update_held_for_review.csv", result.held.to_csv(index=False))
         archive.writestr("conversion_update_excluded.csv", excluded.to_csv(index=False))
