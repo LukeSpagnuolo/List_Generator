@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "locale": "en_US.UTF-8",
+  "metadata": {
+    "appmode": "python-dash",
+    "entrypoint": "app:app"
+  },
+  "python": {
+    "version": "3.12.4",
+    "package_manager": {
+      "name": "pip",
+      "package_file": "requirements.txt"
+    }
+  },
+  "files": {
+    ".env.example": {
+      "checksum": "121ddc0365da0f82144003cb4c1f6b64"
+    },
+    ".gitignore": {
+      "checksum": "3ad84ad9439b0c876d33b9c7b820070f"
+    },
+    "Cities_Extended_Mapped.csv": {
+      "checksum": "b81b483fa0778b7fcfb8125822123802"
+    },
+    "README.md": {
+      "checksum": "88641fa138cc13459abfcd74abec6c03"
+    },
+    "app.py": {
+      "checksum": "6073cdd7e94f572a2b516f4b82d695f5"
+    },
+    "national_inventory_workflow.py": {
+      "checksum": "2a994d9a32354c01e6734f3135dc5aec"
+    },
+    "prebuilt_reports_7000.py": {
+      "checksum": "9276cede4af2125b59e429244089caab"
+    },
+    "requirements.txt": {
+      "checksum": "55bc77cd3c411e7011a31a4d7f1d4baa"
+    }
+  }
+}
