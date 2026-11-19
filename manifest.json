@@ -14,7 +14,7 @@
   },
   "files": {
     ".env.example": {
-      "checksum": "121ddc0365da0f82144003cb4c1f6b64"
+      "checksum": "9e271abdd46a191db4e8890c4812b660"
     },
     ".gitignore": {
       "checksum": "3ad84ad9439b0c876d33b9c7b820070f"
@@ -23,10 +23,10 @@
       "checksum": "b81b483fa0778b7fcfb8125822123802"
     },
     "README.md": {
-      "checksum": "88641fa138cc13459abfcd74abec6c03"
+      "checksum": "c0987294f0bd3089d44d749dd53a8e70"
     },
     "app.py": {
-      "checksum": "6073cdd7e94f572a2b516f4b82d695f5"
+      "checksum": "6f3afa3f9f25c8dbf6195f06ae115bd4"
     },
     "national_inventory_workflow.py": {
       "checksum": "2a994d9a32354c01e6734f3135dc5aec"

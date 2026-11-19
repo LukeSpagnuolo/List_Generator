@@ -86,6 +86,11 @@ MAX_RETRIES = 5
 BACKOFF_SECONDS = 1.5
 REQUEST_TIMEOUT = (10, 90)
 RETRYABLE_STATUSES = {429, 502, 503, 504, 524}
+# Posit Connect (and its proxy) drops a request that runs too long, so "Fetch" runs as a
+# chain of short callbacks: each one fetches pages until FETCH_STEP_SECONDS have passed and
+# keeps the progress in a job file in CACHE_DIR, then the browser asks for the next step.
+FETCH_STEP_SECONDS = float(os.environ.get("LIST_GENERATOR_FETCH_STEP_SECONDS", "15"))
+STEP_REQUEST_TIMEOUT = (10, float(os.environ.get("LIST_GENERATOR_PAGE_TIMEOUT_SECONDS", "40")))
 
 CAMPUS_OPTIONS = [
     {"label": "CSI Pacific - Victoria", "value": 1},
@@ -783,19 +788,13 @@ def fetch_report_frame(
     if not result.complete:
         errors.append(result.error)
     definitions = result.columns or definitions
-    records = [
-        flatten_report_row(row, definitions)
-        if isinstance(row.get("cells"), dict) or isinstance(row.get("meta"), dict)
-        else flatten_json(row)
-        for row in result.rows
-    ]
-    return pd.DataFrame(records), errors, result.pages
+    return rows_to_frame(result.rows, definitions), errors, result.pages
 
 
-def fetch_profiles_for_selection(
-    token: str, campus_value: int | str, role_value: str, source: str = "all"
-) -> tuple[pd.DataFrame, list[str], int]:
-    frame, errors, pages = fetch_report_frame(token)
+
+def filter_selection(
+    frame: pd.DataFrame, campus_value: int | str, role_value: str, source: str = "all"
+) -> pd.DataFrame:
     frame = select_fetch_source(frame, source)
     if isinstance(campus_value, int):
         campus_column = next(
@@ -809,8 +808,168 @@ def fetch_profiles_for_selection(
         frame = frame[
             frame[role_column].fillna("").astype(str).str.lower() == role_value.lower()
         ]
-    return frame, errors, pages
+    return frame
 
+
+def rows_to_frame(rows: list[dict[str, Any]], definitions: list[dict[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            flatten_report_row(row, definitions)
+            if isinstance(row.get("cells"), dict) or isinstance(row.get("meta"), dict)
+            else flatten_json(row)
+            for row in rows
+        ]
+    )
+
+
+# ---- Segmented fetch (one short request per step; see FETCH_STEP_SECONDS) ----
+
+
+def job_path(job_id: str) -> Path:
+    try:
+        canonical = str(uuid.UUID(job_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("Invalid fetch job ID.") from exc
+    return CACHE_DIR / f"{canonical}.job.pkl"  # *.pkl, so cleanup_cache expires it too
+
+
+def save_job(job: dict[str, Any]) -> None:
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = job_path(job["id"])
+    temporary = path.with_suffix(".tmp")
+    pd.to_pickle(job, temporary)
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def load_job(job_id: str | None) -> dict[str, Any]:
+    if not job_id:
+        raise FileNotFoundError("No fetch is running.")
+    path = job_path(job_id)
+    if not path.exists():
+        raise FileNotFoundError("This fetch expired. Fetch again.")
+    return pd.read_pickle(path)
+
+
+def start_fetch_job(
+    token: str,
+    campus_value: int | str,
+    role_value: str,
+    source: str,
+    rows_url: str | None = None,
+    columns_url: str | None = None,
+) -> dict[str, Any]:
+    """Create the job (no rows yet). The token is never written to disk."""
+    errors: list[str] = []
+    try:
+        definitions = fetch_report_columns(token, columns_url)
+    except (requests.RequestException, PermissionError, ValueError) as exc:
+        definitions = []
+        errors.append(f"Column dictionary unavailable: {exc}")
+    selected_keys = [definition.get("key") for definition in definitions if definition.get("key")]
+    url = rows_url or PROFILES_URL
+    if selected_keys:
+        url = with_query(url, columns=",".join(selected_keys))
+    job = {
+        "id": str(uuid.uuid4()),
+        "status": "running",  # running -> done | failed
+        "next_url": with_query(url, limit=PAGE_LIMIT),
+        "pages": 0,
+        "rows": [],
+        "definitions": definitions,
+        "errors": errors,
+        "attempt": 0,
+        "wait": BACKOFF_SECONDS,
+        "retry_at": 0.0,
+        "selection": {"campus": campus_value, "role": role_value, "source": source},
+        "result": None,
+    }
+    save_job(job)
+    return job
+
+
+def _retry_or_fail(job: dict[str, Any], reason: str, retry_after: str | None, now: float) -> None:
+    job["attempt"] += 1
+    if job["attempt"] > MAX_RETRIES:
+        job["status"] = "failed"
+        job["errors"].append(f"{reason} after {MAX_RETRIES + 1} attempts on page {job['pages'] + 1}.")
+        return
+    try:
+        delay = float(retry_after) if retry_after else job["wait"] + random.uniform(0, 0.5)
+    except ValueError:
+        delay = job["wait"]
+    job["retry_at"] = now + delay
+    job["wait"] *= 2
+
+
+def advance_fetch_job(
+    job: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    session: requests.Session | None = None,
+    budget: float = FETCH_STEP_SECONDS,
+    clock=time.time,
+) -> None:
+    """Fetch pages until the job finishes or ``budget`` seconds pass; updates ``job`` in place.
+
+    Each page gets one attempt per step. A retryable failure schedules the retry for a later
+    step (with backoff), so no single request waits through every retry.
+    """
+    client = session or requests.Session()
+    started = clock()
+    while job["status"] == "running":
+        if not job["next_url"]:
+            job["status"] = "done"
+            break
+        if clock() < job["retry_at"]:
+            break
+        page = job["pages"] + 1
+        try:
+            response = client.get(job["next_url"], headers=headers, timeout=STEP_REQUEST_TIMEOUT)
+        except (ReadTimeout, ConnectTimeout, ConnectionError) as exc:
+            _retry_or_fail(job, type(exc).__name__, None, clock())
+            break
+        except requests.RequestException as exc:
+            job["status"] = "failed"
+            job["errors"].append(f"Request failed: {exc}")
+            break
+        if response.status_code in RETRYABLE_STATUSES:
+            _retry_or_fail(job, f"HTTP {response.status_code}", response.headers.get("Retry-After"), clock())
+            break
+        if response.status_code != 200:
+            job["status"] = "failed"
+            job["errors"].append(api_error_message(response, page=page))
+            break
+        try:
+            payload = response.json()
+        except ValueError:
+            job["status"] = "failed"
+            job["errors"].append(f"Invalid JSON on page {page}.")
+            break
+        if isinstance(payload.get("columns"), list):
+            job["definitions"] = payload["columns"]
+        report_key = payload.get("report")
+        results = payload.get(report_key) if report_key else payload.get("results")
+        if not isinstance(results, list):
+            results = payload.get("report_rows")
+        if not isinstance(results, list):
+            job["status"] = "failed"
+            job["errors"].append(f"Unexpected API response on page {page}.")
+            break
+        job["rows"].extend(results)
+        job["pages"] = page
+        job["next_url"] = payload.get("next")
+        job["attempt"], job["wait"], job["retry_at"] = 0, BACKOFF_SECONDS, 0.0
+        if clock() - started >= budget:
+            break
+    if job["status"] == "running" and not job["next_url"]:
+        job["status"] = "done"
+
+
+def finish_fetch_job(job: dict[str, Any]) -> pd.DataFrame:
+    selection = job["selection"]
+    frame = rows_to_frame(job["rows"], job["definitions"])
+    return filter_selection(frame, selection["campus"], selection["role"], selection["source"])
 
 def card(title: str, value_id: str) -> html.Div:
     return html.Div(
@@ -916,6 +1075,10 @@ app.layout = html.Div(
     className="shell",
     children=[
         dcc.Store(id="dataset-id", storage_type="session"),
+        dcc.Store(id="fetch-job", storage_type="memory"),
+        # Drives the segmented fetch: each step raises max_intervals by one, so the next
+        # step starts only after the previous one has returned (no overlapping requests).
+        dcc.Interval(id="fetch-interval", interval=300, n_intervals=0, max_intervals=0, disabled=True),
         dcc.Store(id="ni-cohort", storage_type="memory"),
         html.Div(
             className="hero",
@@ -959,7 +1122,7 @@ app.layout = html.Div(
                     [html.Button("Fetch selected data", id="fetch-button"), html.Span(id="fetch-scope", className="hint")],
                     className="actions",
                 ),
-                dcc.Loading(html.Div(id="fetch-status"), type="circle", color="#1676a3"),
+                html.Div(id="fetch-status"),
             ],
         ),
         html.Div(
@@ -1710,6 +1873,47 @@ def describe_prebuilt_report(report_key: str):
     )
 
 
+def fetch_progress_message(job: dict[str, Any]) -> str:
+    label = FETCH_SOURCE_NOUNS.get(job["selection"]["source"], "rows")
+    note = " (API busy, retrying…)" if job["attempt"] else ""
+    return (
+        f"Fetching {label}… {len(job['rows']):,} rows from {job['pages']} API pages so far{note}. "
+        "Large fetches run in steps; keep this tab open."
+    )
+
+
+@app.callback(
+    Output("fetch-job", "data"),
+    Output("fetch-status", "children", allow_duplicate=True),
+    Output("fetch-status", "className", allow_duplicate=True),
+    Output("fetch-interval", "n_intervals"),
+    Output("fetch-interval", "max_intervals"),
+    Output("fetch-interval", "disabled"),
+    Output("fetch-button", "disabled"),
+    Input("fetch-button", "n_clicks"),
+    State("campus-dd", "value"),
+    State("role-dd", "value"),
+    State("fetch-source", "value"),
+    prevent_initial_call=True,
+)
+def handle_fetch(_: int, campus_value: int | str, role_value: str, source: str):
+    """Check sign-in and start a segmented fetch; poll_fetch fetches the pages."""
+    def stop(message: str):
+        return no_update, message, "status error", no_update, no_update, True, False
+
+    try:
+        token = auth.get_token()
+    except Exception as exc:
+        return stop(f"Authentication failed: {type(exc).__name__}. Please sign in again.")
+    if not token:
+        return stop("No access token. Please sign in again.")
+    actor_error = check_acting_profile(token)
+    if actor_error:
+        return stop(actor_error)
+    job = start_fetch_job(token, campus_value, role_value, source)
+    return job["id"], fetch_progress_message(job), "status", 0, 1, False, True
+
+
 @app.callback(
     Output("dataset-id", "data"),
     Output("fetch-status", "children"),
@@ -1720,26 +1924,59 @@ def describe_prebuilt_report(report_key: str):
     Output("enrollment-dd", "value"),
     Output("nomination-dd", "options"),
     Output("nomination-dd", "value"),
-    Input("fetch-button", "n_clicks"),
-    State("campus-dd", "value"),
-    State("role-dd", "value"),
-    State("fetch-source", "value"),
+    Output("fetch-interval", "max_intervals", allow_duplicate=True),
+    Output("fetch-interval", "disabled", allow_duplicate=True),
+    Output("fetch-button", "disabled", allow_duplicate=True),
+    Input("fetch-interval", "n_intervals"),
+    State("fetch-job", "data"),
     prevent_initial_call=True,
 )
-def handle_fetch(_: int, campus_value: int | str, role_value: str, source: str):
-    try:
-        token = auth.get_token()
-    except Exception as exc:
-        message = f"Authentication failed: {type(exc).__name__}. Please sign in again."
-        return no_update, message, "status error", "—", "—", [], [], [], []
-    if not token:
-        return no_update, "No access token. Please sign in again.", "status error", "—", "—", [], [], [], []
-    actor_error = check_acting_profile(token)
-    if actor_error:
-        return no_update, actor_error, "status error", "—", "—", [], [], [], []
+def poll_fetch(n_intervals: int, job_id: str | None):
+    """One fetch step: fetch pages for up to FETCH_STEP_SECONDS, then report progress or the result."""
+    done = (True, False)  # interval disabled, button enabled
+    keep = (no_update,) * 7
 
-    frame, errors, pages = fetch_profiles_for_selection(token, campus_value, role_value, source)
-    if frame.empty:
+    def stop(message: str, count: str = "—"):
+        return (no_update, message, "status error", count, "—", [], [], [], [], no_update, *done)
+
+    try:
+        job = load_job(job_id)
+    except (FileNotFoundError, ValueError) as exc:
+        return stop(str(exc))
+
+    if job["status"] == "running":
+        try:
+            token = auth.get_token()
+        except Exception as exc:
+            job["status"] = "failed"
+            job["errors"].append(f"Authentication failed: {type(exc).__name__}. Please sign in again.")
+            token = None
+        if job["status"] == "running" and not token:
+            job["status"] = "failed"
+            job["errors"].append("No access token. Please sign in again.")
+        if job["status"] == "running":
+            advance_fetch_job(job, {"Authorization": f"Bearer {token}"})
+        save_job(job)
+        if job["status"] == "running":
+            return (no_update, fetch_progress_message(job), "status", *keep[:6], n_intervals + 1, False, True)
+
+    # Finished (done or failed). Saving the result in the job makes this step safe to repeat.
+    if job["result"] is None:
+        frame = finish_fetch_job(job)
+        job["result"] = {
+            "dataset_id": save_dataset(frame) if not frame.empty else None,
+            "rows": len(frame),
+            "refreshed": datetime.now(timezone.utc).astimezone().strftime("%b %d, %Y %H:%M"),
+            "warnings": blank_field_warnings(frame) if not frame.empty else [],
+            "enrollment": options_for_any(frame, ("enrollment_status", "current_enrollment.admin_status")),
+            "nomination": options_for_any(frame, ("nomination_claimed", "current_nomination.redeemed")),
+        }
+        job["rows"] = []  # the dataset file holds them now
+        save_job(job)
+
+    result, errors, pages = job["result"], job["errors"], job["pages"]
+    source = job["selection"]["source"]
+    if not result["dataset_id"]:
         label = FETCH_SOURCE_NOUNS.get(source, "profiles")
         message = " ".join(errors) if errors else f"No {label} matched the selected filters."
         if not errors and API_VERSION == "v2":
@@ -1747,43 +1984,43 @@ def handle_fetch(_: int, campus_value: int | str, role_value: str, source: str):
                 " In Registration API v2 an empty result can also mean your acting profile "
                 "lacks permissions for this data."
             )
-        return no_update, message, "status error", "0", "—", [], [], [], []
+        return stop(message, "0")
 
-    dataset_id = save_dataset(frame)
-    refreshed = datetime.now(timezone.utc).astimezone().strftime("%b %d, %Y %H:%M")
+    noun = FETCH_SOURCE_NOUNS.get(source, "rows")
     if errors:
         message = (
-            f"Partial result: saved {len(frame):,} {FETCH_SOURCE_NOUNS.get(source, 'rows')} from {pages} API pages. "
+            f"Partial result: saved {result['rows']:,} {noun} from {pages} API pages. "
             + " ".join(errors)
             + " Export only if the missing data is acceptable."
         )
         status_class = "status error"
     else:
         message = (
-            f"Fetched {len(frame):,} {FETCH_SOURCE_NOUNS.get(source, 'rows')} successfully across "
+            f"Fetched {result['rows']:,} {noun} successfully across "
             f"{pages} API pages (Registration API {API_VERSION})."
         )
         status_class = "status"
-    field_warnings = blank_field_warnings(frame)
-    if field_warnings:
+    if result["warnings"]:
         message = [
             html.Div(message),
             html.Div(
                 "Some fields came back empty, which usually means a missing permission rather than "
-                "missing data: " + " ".join(field_warnings),
+                "missing data: " + " ".join(result["warnings"]),
                 className="warning",
             ),
         ]
     return (
-        dataset_id,
+        result["dataset_id"],
         message,
         status_class,
-        f"{len(frame):,}",
-        refreshed,
-        options_for_any(frame, ("enrollment_status", "current_enrollment.admin_status")),
+        f"{result['rows']:,}",
+        result["refreshed"],
+        result["enrollment"],
         [],
-        options_for_any(frame, ("nomination_claimed", "current_nomination.redeemed")),
+        result["nomination"],
         [],
+        no_update,
+        *done,
     )
 
 
@@ -2104,7 +2341,6 @@ if __name__ == "__main__":
         raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
     local_port = urlsplit(APP_URL).port or 8050
     app.run(
-        debug=os.environ.get("DASH_DEBUG", "").lower() == "true",
         host=urlsplit(APP_URL).hostname or "127.0.0.1",
         port=local_port,
     )

@@ -46,7 +46,7 @@ as an allowed redirect URI, for example
 **From Git (recommended):**
 
 1. In Posit Connect: **Publish → Import from Git**, repository
-   `https://github.com/LukeSpagnuolo/List_Generator`, branch `main`, directory `/`.
+   `https://github.com/CSI-Pacific/List-Generator`, branch `main`, directory `/`.
    Connect reads `manifest.json`, so you don't need to choose the app type or entry point.
 2. Open the content's **Vars** panel and add `CLIENT_ID`, `CLIENT_SECRET`,
    `FLASK_SECRET_KEY` and `APP_URL`. Mark the client secret and the secret key as secret.
