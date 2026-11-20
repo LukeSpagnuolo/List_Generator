@@ -1194,6 +1194,10 @@ def build_ee_sport_templates(
                 continue
 
             workbook = load_workbook(template)
+            # Lets the EE Sport Reports tab identify a returned workbook even if it is renamed.
+            workbook.properties.title = "EE Sport Template"
+            workbook.properties.subject = plan.label
+            workbook.properties.keywords = ",".join(_short_year(value) for value in plan.years) or "All Years"
             athlete_sheet = workbook["Athletes"]
             athlete_registered_column = _template_column(
                 athlete_sheet, "Registered with CSI Pacific"
